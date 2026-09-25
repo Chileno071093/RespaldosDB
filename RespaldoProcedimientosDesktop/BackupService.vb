@@ -31,6 +31,8 @@ Friend NotInheritable Class CatalogObject
     Public Property Definition As String
     Public Property AnsiNulls As Boolean
     Public Property QuotedIdentifier As Boolean
+    ' Trigger de servidor (sys.server_triggers), fuera de cualquier base.
+    Public Property IsServerScoped As Boolean
 End Class
 
 Friend NotInheritable Class AnalysisItem
@@ -57,6 +59,8 @@ Friend NotInheritable Class BackupAnalysis
     Public Property FilesWithoutObject As List(Of String)
     Public Property DetectedDeclarations As List(Of String)
     Public Property SourceHashes As Dictionary(Of String, String)
+    ' Sentencias de la liberacion que este respaldo no puede revertir (tablas, datos, permisos...).
+    Public Property UnsupportedStatements As List(Of UnsupportedStatement)
 End Class
 
 Friend NotInheritable Class BackupResult
@@ -103,6 +107,8 @@ Friend NotInheritable Class BackupService
         Dim filesWithoutObject As New List(Of String)()
         Dim sourceHashes As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
         Dim duplicates As New Dictionary(Of String, List(Of DeclaredObject))(StringComparer.OrdinalIgnoreCase)
+        Dim drops As New List(Of DeclaredObject)()
+        Dim unsupported As New List(Of UnsupportedStatement)()
 
         Dim fileCount As Integer = 0
         For Each filePath As String In Directory.EnumerateFiles(sourceRoot, "*.sql", searchOption)
@@ -116,11 +122,15 @@ Friend NotInheritable Class BackupService
             Dim script As String = ReadScript(filePath, hash)
             sourceHashes(filePath) = hash
             cancellation.ThrowIfCancellationRequested()
-            Dim objects As List(Of DeclaredObject) = SqlObjectParser.Parse(script, filePath)
+            Dim objects As List(Of DeclaredObject) = SqlObjectParser.Parse(script, filePath, unsupported)
             If objects.Count = 0 Then filesWithoutObject.Add(filePath)
             For Each item As DeclaredObject In objects
                 Dim databasePrefix As String = If(String.IsNullOrEmpty(item.DatabaseName), "", "[" & item.DatabaseName & "].")
-                detectedDeclarations.Add(filePath & " -> " & databasePrefix & item.DisplayName())
+                detectedDeclarations.Add(filePath & " -> " & If(item.IsDrop, "[DROP] ", "") & databasePrefix & item.DisplayName() & If(item.IsServerScoped, " ON ALL SERVER", ""))
+                If item.IsDrop Then
+                    drops.Add(item)
+                    Continue For
+                End If
                 Dim key As String = item.Kind & "|" & item.DatabaseName & "|" & item.SchemaName & "|" & item.ObjectName
                 Dim first As DeclaredObject = Nothing
                 If Not declared.TryGetValue(key, first) Then
@@ -136,8 +146,22 @@ Friend NotInheritable Class BackupService
             Next
         Next
 
+        ' Un DROP seguido de CREATE del mismo objeto es una modificacion (se marca porque pierde sus permisos);
+        ' un DROP sin CREATE es un objeto que la liberacion elimina y tambien hay que respaldar.
+        For Each drop As DeclaredObject In drops
+            Dim recreated As List(Of DeclaredObject) = declared.Values.Where(Function(x) SameObject(x, drop)).ToList()
+            If recreated.Count > 0 Then
+                For Each item As DeclaredObject In recreated
+                    item.AlsoDropped = True
+                Next
+            Else
+                Dim key As String = "DROP|" & drop.Kind & "|" & drop.DatabaseName & "|" & drop.SchemaName & "|" & drop.ObjectName
+                If Not declared.ContainsKey(key) Then declared.Add(key, drop)
+            End If
+        Next
+
         If declared.Count = 0 Then
-            Throw New InvalidOperationException("No se encontraron declaraciones CREATE o ALTER de procedimientos, vistas, triggers o funciones en los archivos .sql.")
+            Throw New InvalidOperationException("No se encontraron declaraciones CREATE, ALTER o DROP de procedimientos, vistas, triggers, funciones o sinonimos en los archivos .sql.")
         End If
 
         Dim databases As List(Of String) = request.Databases
@@ -149,8 +173,8 @@ Friend NotInheritable Class BackupService
             For databaseIndex As Integer = 0 To databases.Count - 1
                 cancellation.ThrowIfCancellationRequested()
                 Dim databaseName As String = databases(databaseIndex)
-                ' Una declaracion con base explicita ([Base].[esquema].[objeto]) solo se revisa en esa base.
-                Dim targets As List(Of KeyValuePair(Of String, DeclaredObject)) = ordered.Where(Function(x) String.IsNullOrEmpty(x.Value.DatabaseName) OrElse String.Equals(x.Value.DatabaseName, databaseName, StringComparison.OrdinalIgnoreCase)).ToList()
+                ' Una declaracion con base explicita ([Base].[esquema].[objeto]) solo se revisa en esa base; los triggers de servidor, aparte.
+                Dim targets As List(Of KeyValuePair(Of String, DeclaredObject)) = ordered.Where(Function(x) Not x.Value.IsServerScoped AndAlso (String.IsNullOrEmpty(x.Value.DatabaseName) OrElse String.Equals(x.Value.DatabaseName, databaseName, StringComparison.OrdinalIgnoreCase))).ToList()
                 If targets.Count = 0 Then Continue For
                 If progress IsNot Nothing Then progress.Report("Consultando base " & (databaseIndex + 1).ToString() & "/" & databases.Count.ToString() & ": " & databaseName & "...")
                 Dim names As List(Of String) = targets.Select(Function(x) x.Value.ObjectName).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
@@ -172,20 +196,46 @@ Friend NotInheritable Class BackupService
                     Else
                         ClassifyRow(row, catalogByName)
                     End If
-                    rows.Add(AppendDuplicateDetail(row))
+                    rows.Add(AppendNotes(row))
                 Next
             Next
+            ' Si ninguna base respondio (p. ej. password incorrecto), se informa el error como antes.
+            If failures.Count > 0 AndAlso failures.Count = databases.Count Then Throw failures(0)
+
+            ' Triggers de servidor (ON ALL SERVER): se buscan una sola vez en el catalogo del servidor.
+            Dim serverTargets As List(Of KeyValuePair(Of String, DeclaredObject)) = ordered.Where(Function(x) x.Value.IsServerScoped).ToList()
+            If serverTargets.Count > 0 Then
+                cancellation.ThrowIfCancellationRequested()
+                If progress IsNot Nothing Then progress.Report("Consultando triggers de servidor...")
+                Dim serverCatalog As ILookup(Of String, CatalogObject) = Nothing
+                Dim serverFailure As SqlException = Nothing
+                Try
+                    serverCatalog = ReadCatalog(session.UseDatabase("master"), ServerScope, serverTargets.Select(Function(x) x.Value.ObjectName), cancellation, progress, serverScope:=True).ToLookup(Function(x) x.ObjectName, StringComparer.OrdinalIgnoreCase)
+                Catch ex As SqlException
+                    cancellation.ThrowIfCancellationRequested()
+                    serverFailure = ex
+                End Try
+                For Each pair As KeyValuePair(Of String, DeclaredObject) In serverTargets
+                    Dim row As AnalysisItem = NewRow(ServerScope, pair, duplicates)
+                    If serverFailure IsNot Nothing Then
+                        row.Status = "Servidor no disponible"
+                        row.Detail = serverFailure.Message
+                    Else
+                        ClassifyRow(row, serverCatalog)
+                        If row.Status = "No visible o inexistente" Then row.Detail &= " Para ver triggers de servidor el login necesita VIEW ANY DEFINITION."
+                    End If
+                    rows.Add(AppendNotes(row))
+                Next
+            End If
         End Using
-        ' Si ninguna base respondio (p. ej. password incorrecto), se informa el error como antes.
-        If failures.Count > 0 AndAlso failures.Count = databases.Count Then Throw failures(0)
 
         For Each pair As KeyValuePair(Of String, DeclaredObject) In ordered
             Dim item As DeclaredObject = pair.Value
-            If String.IsNullOrEmpty(item.DatabaseName) OrElse databases.Contains(item.DatabaseName, StringComparer.OrdinalIgnoreCase) Then Continue For
+            If item.IsServerScoped OrElse String.IsNullOrEmpty(item.DatabaseName) OrElse databases.Contains(item.DatabaseName, StringComparer.OrdinalIgnoreCase) Then Continue For
             Dim row As AnalysisItem = NewRow(item.DatabaseName, pair, duplicates)
             row.Status = "Otra base"
             row.Detail = "El nombre declarado apunta a [" & item.DatabaseName & "], que no esta entre las bases seleccionadas."
-            rows.Add(AppendDuplicateDetail(row))
+            rows.Add(AppendNotes(row))
         Next
 
         cancellation.ThrowIfCancellationRequested()
@@ -193,8 +243,23 @@ Friend NotInheritable Class BackupService
             .Items = rows,
             .FilesWithoutObject = filesWithoutObject,
             .DetectedDeclarations = detectedDeclarations,
-            .SourceHashes = sourceHashes
+            .SourceHashes = sourceHashes,
+            .UnsupportedStatements = unsupported
         }
+    End Function
+
+    ' Nombre que se usa como "base" para los triggers de servidor (ON ALL SERVER).
+    Friend Const ServerScope As String = "(servidor)"
+    Friend Const UnsupportedReportName As String = "Sentencias_sin_reversion.txt"
+
+    ' Mismo objeto aunque uno de los dos no indique el esquema (DROP PROCEDURE P_X frente a CREATE PROCEDURE dbo.P_X).
+    Private Shared Function SameObject(left As DeclaredObject, right As DeclaredObject) As Boolean
+        Return String.Equals(left.Kind, right.Kind, StringComparison.OrdinalIgnoreCase) AndAlso
+               left.IsServerScoped = right.IsServerScoped AndAlso
+               String.Equals(If(left.DatabaseName, ""), If(right.DatabaseName, ""), StringComparison.OrdinalIgnoreCase) AndAlso
+               String.Equals(left.ObjectName, right.ObjectName, StringComparison.OrdinalIgnoreCase) AndAlso
+               (String.IsNullOrEmpty(left.SchemaName) OrElse String.IsNullOrEmpty(right.SchemaName) OrElse
+                String.Equals(left.SchemaName, right.SchemaName, StringComparison.OrdinalIgnoreCase))
     End Function
 
     Private Shared Function NewRow(databaseName As String, pair As KeyValuePair(Of String, DeclaredObject), duplicates As Dictionary(Of String, List(Of DeclaredObject))) As AnalysisItem
@@ -226,6 +291,11 @@ Friend NotInheritable Class BackupService
     End Sub
 
     Private Shared Sub SummarizeChanges(row As AnalysisItem)
+        If row.Declaration.IsDrop Then
+            row.HasChanges = True
+            row.ChangeSummary = "Se elimina"
+            Return
+        End If
         Dim diff As DiffResult = DiffService.Compare(row.Current.Definition, row.Declaration.CandidateText, False)
         row.HasChanges = diff.HasDifferences
         row.ChangeSummary = If(diff.HasDifferences, "-" & diff.Removed.ToString() & " +" & diff.Added.ToString(), "Iguales")
@@ -237,7 +307,13 @@ Friend NotInheritable Class BackupService
         End If
     End Sub
 
-    Private Shared Function AppendDuplicateDetail(row As AnalysisItem) As AnalysisItem
+    Private Shared Function AppendNotes(row As AnalysisItem) As AnalysisItem
+        If row.Declaration.IsDrop Then
+            row.Detail = "La liberacion ELIMINA este objeto (DROP)." &
+                         If(row.CanBackup, " Se respalda su definicion actual y el script de reversion lo vuelve a crear (sin sus permisos).", " " & row.Detail)
+        ElseIf row.Declaration.AlsoDropped Then
+            row.Detail &= " El script lo elimina (DROP) y lo vuelve a crear: se pierden sus permisos (GRANT); revisalos despues de liberar."
+        End If
         If row.AlsoDeclaredIn.Count > 0 Then
             row.Detail &= " Declarado tambien en: " & String.Join(", ", row.AlsoDeclaredIn.Select(Function(x) Path.GetFileName(x.SourceFile))) & " (usa Comparar para revisar cada archivo)."
         End If
@@ -287,7 +363,7 @@ Friend NotInheritable Class BackupService
                         command.CommandTimeout = 10
                         command.CommandText = "SELECT s.name, o.name, o.type FROM sys.objects AS o " &
                                               "JOIN sys.schemas AS s ON s.schema_id = o.schema_id " &
-                                              "WHERE o.type IN ('P','V','TR','FN','IF','TF') AND o.name IN (" & nameFilter & ") " &
+                                              "WHERE o.type IN ('P','V','TR','FN','IF','TF','SN') AND o.name IN (" & nameFilter & ") " &
                                               "UNION ALL SELECT CAST(NULL AS nvarchar(128)), t.name, t.type " &
                                               "FROM sys.triggers AS t WHERE t.parent_class = 0 AND t.type = 'TR' AND t.name IN (" & nameFilter & ");"
                         For index As Integer = 0 To names.Count - 1
@@ -472,7 +548,8 @@ Friend NotInheritable Class BackupService
         If progress IsNot Nothing Then progress.Report("Verificando las definiciones seleccionadas en SQL Server...")
         Using session As New DatabaseSession(request, cancellation)
             For Each group As IGrouping(Of String, AnalysisItem) In selected.GroupBy(Function(x) x.DatabaseName, StringComparer.OrdinalIgnoreCase)
-                Dim currentByName As ILookup(Of String, CatalogObject) = ReadCatalog(session.UseDatabase(group.Key), group.Key, group.Select(Function(x) x.Current.ObjectName), cancellation, progress).ToLookup(Function(x) x.ObjectName, StringComparer.OrdinalIgnoreCase)
+                Dim isServer As Boolean = group.Key = ServerScope
+                Dim currentByName As ILookup(Of String, CatalogObject) = ReadCatalog(session.UseDatabase(If(isServer, "master", group.Key)), group.Key, group.Select(Function(x) x.Current.ObjectName), cancellation, progress, serverScope:=isServer).ToLookup(Function(x) x.ObjectName, StringComparer.OrdinalIgnoreCase)
                 For Each row As AnalysisItem In group
                     cancellation.ThrowIfCancellationRequested()
                     Dim matchesNow As List(Of CatalogObject) = currentByName(row.Current.ObjectName).Where(Function(x) ExactMatch(row.Current, x)).ToList()
@@ -514,17 +591,19 @@ Friend NotInheritable Class BackupService
                 If progress IsNot Nothing Then progress.Report("Guardando objeto " & (savedCount + 1).ToString() & "/" & selected.Count.ToString() & ": [" & row.DatabaseName & "] " & row.Declaration.DisplayName())
                 Dim entry As CatalogObject = row.Current
                 Dim kind As String = KindName(entry.TypeCode)
-                Dim relativeFolder As String = If(perDatabaseFolders, Path.Combine(SafeFileName(row.DatabaseName), FolderName(kind)), FolderName(kind))
+                Dim isServer As Boolean = row.DatabaseName = ServerScope
+                Dim relativeFolder As String = If(perDatabaseFolders, Path.Combine(DatabaseFolder(row.DatabaseName), FolderName(kind)), FolderName(kind))
                 Dim folder As String = Path.Combine(stagingFolder, relativeFolder)
                 Directory.CreateDirectory(folder)
                 Dim objectLabel As String = If(String.IsNullOrEmpty(entry.SchemaName),
                                                "[" & entry.ObjectName & "]",
                                                "[" & entry.SchemaName & "].[" & entry.ObjectName & "]")
-                Dim fileName As String = SafeFileName(objectLabel & "_" & row.DatabaseName & ".sql")
+                Dim fileName As String = SafeFileName(objectLabel & "_" & If(isServer, "servidor", row.DatabaseName) & ".sql")
                 Dim filePath As String = Path.Combine(folder, fileName)
                 If File.Exists(filePath) Then Throw New IOException("Nombre de archivo repetido para " & kind & " " & objectLabel & " en [" & row.DatabaseName & "]")
 
-                Dim quotedDatabase As String = "[" & row.DatabaseName.Replace("]", "]]") & "]"
+                ' Los triggers de servidor se crean desde cualquier base; se usa master.
+                Dim quotedDatabase As String = If(isServer, "[master]", "[" & row.DatabaseName.Replace("]", "]]") & "]")
                 Dim ansiValue As String = If(entry.AnsiNulls, "ON", "OFF")
                 Dim quotedValue As String = If(entry.QuotedIdentifier, "ON", "OFF")
                 Dim header As String = "USE " & quotedDatabase & vbCrLf & "GO" & vbCrLf &
@@ -541,12 +620,13 @@ Friend NotInheritable Class BackupService
 
             cancellation.ThrowIfCancellationRequested()
             If progress IsNot Nothing Then progress.Report("Generando scripts de reversion...")
+            Dim unsupportedCount As Integer = If(analysis.UnsupportedStatements Is Nothing, 0, analysis.UnsupportedStatements.Count)
             For Each databaseName As String In databaseNames
                 cancellation.ThrowIfCancellationRequested()
                 Dim objects As IEnumerable(Of CatalogObject) = selected.Where(Function(x) String.Equals(x.DatabaseName, databaseName, StringComparison.OrdinalIgnoreCase)).Select(Function(x) x.Current)
-                Dim relativePath As String = Path.Combine(If(perDatabaseFolders, SafeFileName(databaseName), ""), SafeFileName("Restaurar_" & databaseName & ".sql"))
+                Dim relativePath As String = Path.Combine(If(perDatabaseFolders, DatabaseFolder(databaseName), ""), SafeFileName("Restaurar_" & If(databaseName = ServerScope, "servidor", databaseName) & ".sql"))
                 Dim hash As String = WriteVerified(Path.Combine(stagingFolder, relativePath),
-                                                   RestoreScriptBuilder.Build(databaseName, request.Server, objects, backupTime), utf16Le)
+                                                   RestoreScriptBuilder.Build(databaseName, request.Server, objects, backupTime, unsupportedCount), utf16Le)
                 restoreScripts.Add(relativePath)
                 longestRelativePath = Math.Max(longestRelativePath, relativePath.Length)
                 verificationLines.Add("[" & databaseName & "] Script de reversion | " & relativePath & " | SHA256 " & hash)
@@ -563,6 +643,13 @@ Friend NotInheritable Class BackupService
             If analysis.FilesWithoutObject.Count > 0 Then
                 WriteVerified(Path.Combine(stagingFolder, "Archivos_sin_objetos.txt"),
                               String.Join(vbCrLf, analysis.FilesWithoutObject) & vbCrLf, utf16Le)
+            End If
+            If unsupportedCount > 0 Then
+                WriteVerified(Path.Combine(stagingFolder, UnsupportedReportName),
+                              "Sentencias de la liberacion que este respaldo NO cubre y el script de reversion NO deshace." & vbCrLf &
+                              "Para revertirlas hace falta otro mecanismo (por ejemplo, un respaldo completo de la base con BACKUP DATABASE)." & vbCrLf &
+                              "Archivo:linea | Tipo | Sentencia" & vbCrLf & vbCrLf &
+                              String.Join(vbCrLf, analysis.UnsupportedStatements.Select(Function(x) x.ToString())) & vbCrLf, utf16Le)
             End If
 
             Dim typeCounts As String = String.Join(vbCrLf, selected.GroupBy(Function(x) x.DatabaseName, StringComparer.OrdinalIgnoreCase).OrderBy(Function(x) x.Key, StringComparer.OrdinalIgnoreCase).Select(
@@ -627,7 +714,7 @@ Friend NotInheritable Class BackupService
     Private Shared Function ReadScript(filePath As String, ByRef hash As String) As String
         Dim bytes As Byte() = File.ReadAllBytes(LongPath(filePath))
         Using sha As SHA256 = SHA256.Create()
-            hash =BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-", "")
+            hash = BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-", "")
         End Using
         Return DecodeScript(bytes)
     End Function
@@ -666,7 +753,9 @@ Friend NotInheritable Class BackupService
     End Function
 
     ' Lee las definiciones en la base a la que ya apunta la conexion (ver DatabaseSession).
-    Private Shared Function ReadCatalog(connection As SqlConnection, databaseName As String, objectNames As IEnumerable(Of String), cancellation As CancellationToken, progress As IProgress(Of String)) As List(Of CatalogObject)
+    ' Con serverScope lee los triggers de servidor (ON ALL SERVER) en lugar de los objetos de la base.
+    ' Los sinonimos no estan en sys.sql_modules: su definicion se arma con el objeto al que apuntan.
+    Private Shared Function ReadCatalog(connection As SqlConnection, databaseName As String, objectNames As IEnumerable(Of String), cancellation As CancellationToken, progress As IProgress(Of String), Optional serverScope As Boolean = False) As List(Of CatalogObject)
         Dim result As New List(Of CatalogObject)()
         Dim names As List(Of String) = objectNames.Where(Function(x) Not String.IsNullOrEmpty(x)).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
         If names.Count = 0 Then Return result
@@ -686,16 +775,28 @@ Friend NotInheritable Class BackupService
                         command.Parameters.Add(parameterName, SqlDbType.NVarChar, 128).Value = batch(index)
                     Next
                     Dim nameFilter As String = String.Join(",", placeholders)
-                    command.CommandText = "SELECT s.name, o.name, o.type, m.definition, m.uses_ansi_nulls, m.uses_quoted_identifier " &
-                                          "FROM sys.objects AS o " &
-                                          "JOIN sys.schemas AS s ON s.schema_id = o.schema_id " &
-                                          "JOIN sys.sql_modules AS m ON m.object_id = o.object_id " &
-                                          "WHERE o.type IN ('P','V','TR','FN','IF','TF') AND o.name IN (" & nameFilter & ") " &
-                                          "UNION ALL " &
-                                          "SELECT CAST(NULL AS nvarchar(128)), t.name, t.type, m.definition, m.uses_ansi_nulls, m.uses_quoted_identifier " &
-                                          "FROM sys.triggers AS t " &
-                                          "JOIN sys.sql_modules AS m ON m.object_id = t.object_id " &
-                                          "WHERE t.parent_class = 0 AND t.name IN (" & nameFilter & ");"
+                    If serverScope Then
+                        command.CommandText = "SELECT CAST(NULL AS nvarchar(128)), t.name, t.type, m.definition, m.uses_ansi_nulls, m.uses_quoted_identifier " &
+                                              "FROM sys.server_triggers AS t " &
+                                              "JOIN sys.server_sql_modules AS m ON m.object_id = t.object_id " &
+                                              "WHERE t.name IN (" & nameFilter & ");"
+                    Else
+                        command.CommandText = "SELECT s.name, o.name, o.type, m.definition, m.uses_ansi_nulls, m.uses_quoted_identifier " &
+                                              "FROM sys.objects AS o " &
+                                              "JOIN sys.schemas AS s ON s.schema_id = o.schema_id " &
+                                              "JOIN sys.sql_modules AS m ON m.object_id = o.object_id " &
+                                              "WHERE o.type IN ('P','V','TR','FN','IF','TF') AND o.name IN (" & nameFilter & ") " &
+                                              "UNION ALL " &
+                                              "SELECT CAST(NULL AS nvarchar(128)), t.name, t.type, m.definition, m.uses_ansi_nulls, m.uses_quoted_identifier " &
+                                              "FROM sys.triggers AS t " &
+                                              "JOIN sys.sql_modules AS m ON m.object_id = t.object_id " &
+                                              "WHERE t.parent_class = 0 AND t.name IN (" & nameFilter & ") " &
+                                              "UNION ALL " &
+                                              "SELECT s.name, sy.name, sy.type, N'CREATE SYNONYM ' + QUOTENAME(s.name) + N'.' + QUOTENAME(sy.name) + N' FOR ' + sy.base_object_name, CAST(1 AS bit), CAST(1 AS bit) " &
+                                              "FROM sys.synonyms AS sy " &
+                                              "JOIN sys.schemas AS s ON s.schema_id = sy.schema_id " &
+                                              "WHERE sy.name IN (" & nameFilter & ");"
+                    End If
                     Using registration As CancellationTokenRegistration = cancellation.Register(Sub() CancelCommand(command))
                         cancellation.ThrowIfCancellationRequested()
                         Using reader As SqlDataReader = command.ExecuteReader()
@@ -707,7 +808,8 @@ Friend NotInheritable Class BackupService
                                     .TypeCode = reader.GetString(2).Trim(),
                                     .Definition = If(reader.IsDBNull(3), Nothing, reader.GetString(3)),
                                     .AnsiNulls = reader.GetBoolean(4),
-                                    .QuotedIdentifier = reader.GetBoolean(5)
+                                    .QuotedIdentifier = reader.GetBoolean(5),
+                                    .IsServerScoped = serverScope
                                 })
                             End While
                         End Using
@@ -757,6 +859,7 @@ Friend NotInheritable Class BackupService
             Case "V" : Return "Vista"
             Case "TR" : Return "Trigger"
             Case "FN", "IF", "TF" : Return "Funcion"
+            Case "SN" : Return "Sinonimo"
             Case Else : Return "Desconocido"
         End Select
     End Function
@@ -766,8 +869,14 @@ Friend NotInheritable Class BackupService
             Case "Procedimiento" : Return "Procedimientos"
             Case "Vista" : Return "Vistas"
             Case "Trigger" : Return "Triggers"
+            Case "Sinonimo" : Return "Sinonimos"
             Case Else : Return "Funciones"
         End Select
+    End Function
+
+    ' Carpeta y sufijo de archivo de cada "base"; los triggers de servidor van en "Servidor".
+    Private Shared Function DatabaseFolder(databaseName As String) As String
+        Return If(databaseName = ServerScope, "Servidor", SafeFileName(databaseName))
     End Function
 
     Private Shared Function SafeFileName(value As String) As String

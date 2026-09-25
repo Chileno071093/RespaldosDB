@@ -1,5 +1,6 @@
 Imports System
 Imports System.Collections.Generic
+Imports System.Linq
 Imports System.Text
 Imports System.Text.RegularExpressions
 Imports Microsoft.VisualBasic
@@ -34,7 +35,7 @@ End Class
 Friend NotInheritable Class DiffService
     ' Limite de ediciones para Myers (memoria ~ MaxEdits^2 enteros); por encima se muestra el resto como reemplazo completo.
     Private Const MaxEdits As Integer = 2000
-    Private Shared ReadOnly LeadingKeyword As New Regex("^(?:CREATE\s+OR\s+ALTER|ALTER|CREATE)\s+(?<kind>PROCEDURE|PROC|VIEW|TRIGGER|FUNCTION)\b", RegexOptions.IgnoreCase)
+    Private Shared ReadOnly LeadingKeyword As New Regex("^(?:CREATE\s+OR\s+ALTER|ALTER|CREATE)\s+(?<kind>PROCEDURE|PROC|VIEW|TRIGGER|FUNCTION|SYNONYM)\b", RegexOptions.IgnoreCase)
     Private Shared ReadOnly Whitespace As New Regex("\s+")
 
     Private Sub New()
@@ -46,9 +47,14 @@ Friend NotInheritable Class DiffService
     Public Shared Function DeclarationText(definition As String) As String
         If definition Is Nothing Then Return ""
         Dim text As String = definition
-        Dim declarations As List(Of DeclaredObject) = SqlObjectParser.Parse(definition, Nothing)
-        If declarations.Count > 0 Then text = declarations(0).CandidateText
-        Return LeadingKeyword.Replace(text.Trim(), AddressOf NormalizedHeader, 1)
+        Dim declaration As DeclaredObject = SqlObjectParser.Parse(definition, Nothing).FirstOrDefault(Function(x) Not x.IsDrop)
+        If declaration IsNot Nothing Then text = declaration.CandidateText
+        text = LeadingKeyword.Replace(text.Trim(), AddressOf NormalizedHeader, 1)
+        ' Sinonimos: SQL Server devuelve el nombre y el destino con corchetes; se comparan sin ellos.
+        If text.StartsWith("CREATE SYNONYM", StringComparison.Ordinal) Then
+            text = Whitespace.Replace(text.Replace("[", "").Replace("]", ""), " ").Trim().TrimEnd(";"c)
+        End If
+        Return text
     End Function
 
     Private Shared Function NormalizedHeader(match As Match) As String

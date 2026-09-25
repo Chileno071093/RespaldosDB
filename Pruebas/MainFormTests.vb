@@ -177,7 +177,7 @@ Public Class MainFormTests
             ClickAndWait(form, analyze)
             Dim summary As String = GetField(Of Label)(form, "summaryLabel").Text
             Check("4 filas: 2 objetos x 2 bases", grid.Rows.Count = 4, output.Text)
-            Check("Resumen con bases y cambios", summary.StartsWith("4 filas (objeto por base) en 2 base(s); 3 listas (1 con cambios)"), summary)
+            Check("Resumen con bases y cambios", summary.StartsWith("4 filas (objeto por base) en 2 base(s); 3 listas (1 con cambios, 0 se eliminan)"), summary)
             Dim changes As Dictionary(Of String, String) = grid.Rows.Cast(Of DataGridViewRow)().ToDictionary(Function(r) CStr(r.Cells(1).Value) & "|" & CStr(r.Cells(3).Value), Function(r) CStr(r.Cells(6).Value))
             Check("Cambios: P_Uno igual en la base 1", changes(db1 & "|Procedimiento [dbo].[P_Uno]") = "Iguales", changes(db1 & "|Procedimiento [dbo].[P_Uno]"))
             Check("Cambios: P_Uno distinto en la base 2", changes(db2 & "|Procedimiento [dbo].[P_Uno]") = "-1 +1", changes(db2 & "|Procedimiento [dbo].[P_Uno]"))

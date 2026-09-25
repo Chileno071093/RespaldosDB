@@ -70,6 +70,13 @@ Public Class DiffServiceTests
     End Sub
 
     <TestMethod>
+    Public Sub SinonimoSeComparaSinCorchetes()
+        Const stored As String = "CREATE SYNONYM [dbo].[S_T] FOR [OtraBase].[dbo].[Tabla]"
+        Assert.IsFalse(DiffService.Compare(stored, "CREATE SYNONYM dbo.S_T  FOR OtraBase.dbo.Tabla;", False).HasDifferences)
+        Assert.IsTrue(DiffService.Compare(stored, "CREATE SYNONYM dbo.S_T FOR OtraBase.dbo.Tabla2", False).HasDifferences)
+    End Sub
+
+    <TestMethod>
     Public Sub CambioRealSeDetecta()
         Dim result As DiffResult = DiffService.Compare(Stored, "ALTER PROCEDURE dbo.P_A" & vbCrLf & "AS" & vbCrLf & "SELECT 2", False)
         Assert.AreEqual(1, result.Removed)

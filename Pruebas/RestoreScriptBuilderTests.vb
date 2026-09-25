@@ -12,6 +12,23 @@ Public Class RestoreScriptBuilderTests
     End Sub
 
     <TestMethod>
+    Public Sub SinonimosYTriggersDeServidor()
+        Dim synonym As New CatalogObject With {.SchemaName = "dbo", .ObjectName = "S_T", .TypeCode = "SN", .Definition = "CREATE SYNONYM [dbo].[S_T] FOR [dbo].[T]", .AnsiNulls = True, .QuotedIdentifier = True}
+        Dim procedure As New CatalogObject With {.SchemaName = "dbo", .ObjectName = "P", .TypeCode = "P", .Definition = "CREATE PROCEDURE dbo.P AS SELECT 1", .AnsiNulls = True, .QuotedIdentifier = True}
+        Dim database As String = RestoreScriptBuilder.Build("Base", "SRV", {procedure, synonym}, DateTime.Now, 3)
+        StringAssert.Contains(database, "IF OBJECT_ID(N'[dbo].[S_T]', N'SN') IS NOT NULL DROP SYNONYM [dbo].[S_T]")
+        Assert.IsTrue(database.IndexOf("Sinonimo", StringComparison.Ordinal) < database.IndexOf("Procedimiento [dbo].[P]", StringComparison.Ordinal), "Los sinonimos van primero")
+        StringAssert.Contains(database, "3 sentencia(s) que este script NO deshace")
+
+        Dim serverTrigger As New CatalogObject With {.ObjectName = "TRS", .TypeCode = "TR", .IsServerScoped = True, .Definition = "CREATE TRIGGER TRS ON ALL SERVER FOR CREATE_LOGIN AS PRINT 1", .AnsiNulls = True, .QuotedIdentifier = True}
+        Dim server As String = RestoreScriptBuilder.Build(BackupService.ServerScope, "SRV", {serverTrigger}, DateTime.Now)
+        StringAssert.Contains(server, "USE [master]")
+        StringAssert.Contains(server, "IF NOT EXISTS (SELECT 1 FROM sys.server_triggers WHERE name = N'TRS')")
+        StringAssert.Contains(server, "ALTER TRIGGER TRS ON ALL SERVER")
+        Assert.IsFalse(server.Contains("NO deshace"))
+    End Sub
+
+    <TestMethod>
     Public Sub ToAlterSinDeclaracionDevuelveNothing()
         Assert.IsNull(RestoreScriptBuilder.ToAlter("SELECT 1"))
     End Sub

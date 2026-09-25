@@ -14,25 +14,40 @@ Friend NotInheritable Class RestoreScriptBuilder
     Private Sub New()
     End Sub
 
-    Public Shared Function Build(databaseName As String, server As String, objects As IEnumerable(Of CatalogObject), createdAt As DateTime) As String
+    Public Shared Function Build(databaseName As String, server As String, objects As IEnumerable(Of CatalogObject), createdAt As DateTime, Optional unsupportedCount As Integer = 0) As String
         Dim ordered As List(Of CatalogObject) = objects.OrderBy(Function(x) RestoreOrder(x.TypeCode)).
                                                        ThenBy(Function(x) x.SchemaName, StringComparer.OrdinalIgnoreCase).
                                                        ThenBy(Function(x) x.ObjectName, StringComparer.OrdinalIgnoreCase).ToList()
+        Dim isServer As Boolean = databaseName = BackupService.ServerScope
         Dim script As New StringBuilder()
         AppendLine(script, "-- Script de reversion generado por Respaldo objetos SQL TE")
-        AppendLine(script, "-- Servidor: " & server & " | Base: " & databaseName & " | Respaldo: " & createdAt.ToString("yyyy-MM-dd HH:mm:ss"))
+        AppendLine(script, "-- Servidor: " & server & " | " & If(isServer, "Triggers de servidor", "Base: " & databaseName) & " | Respaldo: " & createdAt.ToString("yyyy-MM-dd HH:mm:ss"))
         AppendLine(script, "-- Devuelve " & ordered.Count.ToString() & " objeto(s) a la definicion respaldada.")
         AppendLine(script, "-- Los objetos existentes se modifican con ALTER, por lo que se conservan sus permisos.")
-        AppendLine(script, "-- Si un objeto ya no existe, primero se crea un esqueleto minimo y luego se aplica el ALTER.")
-        AppendLine(script, "-- Orden: funciones, vistas, procedimientos y triggers. Ejecutelo completo y revise los mensajes.")
+        AppendLine(script, "-- Si un objeto ya no existe (por ejemplo, la liberacion lo elimino), primero se crea un esqueleto minimo y luego")
+        AppendLine(script, "-- se aplica el ALTER; en ese caso hay que volver a otorgar sus permisos (GRANT), que no se respaldan.")
+        AppendLine(script, "-- Los sinonimos no admiten ALTER: se eliminan y se vuelven a crear.")
+        AppendLine(script, "-- Orden: sinonimos, funciones, vistas, procedimientos y triggers. Ejecutelo completo y revise los mensajes.")
+        If unsupportedCount > 0 Then
+            AppendLine(script, "-- ATENCION: la liberacion trae " & unsupportedCount.ToString() & " sentencia(s) que este script NO deshace (tablas, datos, permisos...).")
+            AppendLine(script, "-- Revise " & BackupService.UnsupportedReportName & " en la carpeta del respaldo.")
+        End If
         AppendLine(script, "")
-        AppendLine(script, "USE " & QuoteName(databaseName))
+        ' Los triggers de servidor se crean y modifican desde cualquier base; se usa master.
+        AppendLine(script, "USE " & If(isServer, "[master]", QuoteName(databaseName)))
         AppendLine(script, "GO")
 
         For Each entry As CatalogObject In ordered
             Dim label As String = If(String.IsNullOrEmpty(entry.SchemaName), QuoteName(entry.ObjectName), QuoteName(entry.SchemaName) & "." & QuoteName(entry.ObjectName))
             AppendLine(script, "")
-            AppendLine(script, "-- ===== " & KindLabel(entry.TypeCode) & " " & label & " =====")
+            AppendLine(script, "-- ===== " & KindLabel(entry.TypeCode) & " " & label & If(entry.IsServerScoped, " (servidor)", "") & " =====")
+            If entry.TypeCode = "SN" Then
+                AppendLine(script, "IF OBJECT_ID(N'" & label.Replace("'", "''") & "', N'SN') IS NOT NULL DROP SYNONYM " & label)
+                AppendLine(script, "GO")
+                AppendLine(script, entry.Definition)
+                AppendLine(script, "GO")
+                Continue For
+            End If
             AppendLine(script, "SET ANSI_NULLS " & If(entry.AnsiNulls, "ON", "OFF"))
             AppendLine(script, "GO")
             AppendLine(script, "SET QUOTED_IDENTIFIER " & If(entry.QuotedIdentifier, "ON", "OFF"))
@@ -55,9 +70,9 @@ Friend NotInheritable Class RestoreScriptBuilder
     ' Cambia solo la palabra CREATE de la declaracion por ALTER; conserva los comentarios previos y el resto del texto.
     Friend Shared Function ToAlter(definition As String) As String
         If definition Is Nothing Then Return Nothing
-        Dim declarations As List(Of DeclaredObject) = SqlObjectParser.Parse(definition, Nothing)
-        If declarations.Count = 0 Then Return Nothing
-        Dim start As Integer = declarations(0).DeclarationStart
+        Dim declaration As DeclaredObject = SqlObjectParser.Parse(definition, Nothing).FirstOrDefault(Function(x) Not x.IsDrop)
+        If declaration Is Nothing Then Return Nothing
+        Dim start As Integer = declaration.DeclarationStart
         Dim rest As String = definition.Substring(start)
         Dim match As Match = LeadingKeyword.Match(rest)
         If Not match.Success Then Return Nothing
@@ -65,6 +80,9 @@ Friend NotInheritable Class RestoreScriptBuilder
     End Function
 
     Private Shared Function MissingCondition(entry As CatalogObject, label As String) As String
+        If entry.IsServerScoped Then
+            Return "NOT EXISTS (SELECT 1 FROM sys.server_triggers WHERE name = N'" & entry.ObjectName.Replace("'", "''") & "')"
+        End If
         If String.IsNullOrEmpty(entry.SchemaName) Then
             ' Trigger de base de datos (DDL): no pertenece a un esquema, OBJECT_ID no lo encuentra.
             Return "NOT EXISTS (SELECT 1 FROM sys.triggers WHERE parent_class = 0 AND name = N'" & entry.ObjectName.Replace("'", "''") & "')"
@@ -85,10 +103,11 @@ Friend NotInheritable Class RestoreScriptBuilder
 
     Private Shared Function RestoreOrder(typeCode As String) As Integer
         Select Case typeCode
-            Case "FN", "IF", "TF" : Return 0
-            Case "V" : Return 1
-            Case "P" : Return 2
-            Case Else : Return 3
+            Case "SN" : Return 0
+            Case "FN", "IF", "TF" : Return 1
+            Case "V" : Return 2
+            Case "P" : Return 3
+            Case Else : Return 4
         End Select
     End Function
 
@@ -97,6 +116,7 @@ Friend NotInheritable Class RestoreScriptBuilder
             Case "P" : Return "Procedimiento"
             Case "V" : Return "Vista"
             Case "TR" : Return "Trigger"
+            Case "SN" : Return "Sinonimo"
             Case Else : Return "Funcion"
         End Select
     End Function

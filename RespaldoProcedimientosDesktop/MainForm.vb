@@ -454,11 +454,23 @@ Friend NotInheritable Class MainForm
         Dim ready As Integer = result.Items.Where(Function(x) x.CanBackup).Count()
         Dim databaseCount As Integer = result.Items.Select(Function(x) x.DatabaseName).Distinct(StringComparer.OrdinalIgnoreCase).Count()
         summaryLabel.Text = result.Items.Count.ToString() & " filas (objeto por base) en " & databaseCount.ToString() & " base(s); " &
-                            ready.ToString() & " listas (" & result.Items.Where(Function(x) x.HasChanges).Count().ToString() & " con cambios); " &
-                            (result.Items.Count - ready).ToString() & " requieren revision."
+                            ready.ToString() & " listas (" & result.Items.Where(Function(x) x.HasChanges).Count().ToString() & " con cambios, " &
+                            result.Items.Where(Function(x) x.CanBackup AndAlso x.Declaration.IsDrop).Count().ToString() & " se eliminan); " &
+                            (result.Items.Count - ready).ToString() & " requieren revision." &
+                            If(result.UnsupportedStatements.Count > 0, " " & result.UnsupportedStatements.Count.ToString() & " sentencia(s) sin reversion.", "")
         outputBox.Text = "Marca objetos para el respaldo. Selecciona filas (Ctrl/Shift) para Comparar o Buscar en bases."
         If result.FilesWithoutObject.Count > 0 Then
             outputBox.AppendText(vbCrLf & result.FilesWithoutObject.Count.ToString() & " archivo(s) .sql sin declaraciones reconocidas.")
+        End If
+        If result.UnsupportedStatements.Count > 0 Then
+            ' Van primero: es lo que el respaldo no puede deshacer.
+            Const shown As Integer = 10
+            Dim lines As IEnumerable(Of String) = result.UnsupportedStatements.Take(shown).Select(Function(x) Path.GetFileName(x.SourceFile) & ":" & x.Line.ToString() & " | " & x.Category & " | " & x.Text)
+            outputBox.Text = "ATENCION: " & result.UnsupportedStatements.Count.ToString() & " sentencia(s) de la liberacion NO se pueden revertir con este respaldo " &
+                             "(tablas, datos, permisos...). Se listan en " & BackupService.UnsupportedReportName & " al respaldar." & vbCrLf &
+                             String.Join(vbCrLf, lines) &
+                             If(result.UnsupportedStatements.Count > shown, vbCrLf & "... y " & (result.UnsupportedStatements.Count - shown).ToString() & " mas.", "") &
+                             vbCrLf & vbCrLf & outputBox.Text
         End If
     End Sub
 
