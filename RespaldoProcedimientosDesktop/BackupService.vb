@@ -65,6 +65,8 @@ Friend NotInheritable Class BackupResult
     Public Property Skipped As List(Of String)
     Public Property VerifiedFiles As Integer
     Public Property RestoreScripts As List(Of String)
+    ' Largo de la ruta completa mas larga que se escribio (para avisar si supera el limite clasico de Windows).
+    Public Property LongestPath As Integer
 End Class
 
 Friend NotInheritable Class DatabaseLocation
@@ -461,7 +463,7 @@ Friend NotInheritable Class BackupService
             cancellation.ThrowIfCancellationRequested()
             Dim expectedHash As String = Nothing
             If Not analysis.SourceHashes.TryGetValue(sourceFile, expectedHash) OrElse
-               Not File.Exists(sourceFile) OrElse
+               Not File.Exists(LongPath(sourceFile)) OrElse
                Not String.Equals(FileHash(sourceFile), expectedHash, StringComparison.Ordinal) Then
                 Throw New InvalidOperationException("El archivo " & sourceFile & " cambio desde la vista previa. Vuelve a analizar.")
             End If
@@ -492,9 +494,11 @@ Friend NotInheritable Class BackupService
         Dim destinationRoot As String = Path.GetFullPath(request.DestinationFolder)
         Dim backupTime As DateTime = DateTime.Now
         Dim finalFolder As String = Path.Combine(destinationRoot, "Respaldo_Objetos_" & backupTime.ToString("yyyyMMdd_HHmmss"))
-        If Directory.Exists(finalFolder) Then Throw New IOException("La carpeta de salida ya existe: " & finalFolder)
-        Directory.CreateDirectory(destinationRoot)
-        Dim stagingFolder As String = Path.Combine(destinationRoot, ".respaldo_temp_" & Guid.NewGuid().ToString("N"))
+        If Directory.Exists(LongPath(finalFolder)) Then Throw New IOException("La carpeta de salida ya existe: " & finalFolder)
+        Directory.CreateDirectory(LongPath(destinationRoot))
+        ' Toda la escritura va con prefijo de ruta larga; el nombre temporal es corto para no gastar caracteres.
+        Dim stagingFolder As String = LongPath(Path.Combine(destinationRoot, ".rtmp_" & Guid.NewGuid().ToString("N").Substring(0, 8)))
+        Dim longestRelativePath As Integer = 0
         Dim utf16Le As New UnicodeEncoding(False, True)
         Dim savedObjects As New List(Of String)()
         Dim verificationLines As New List(Of String)()
@@ -529,6 +533,7 @@ Friend NotInheritable Class BackupService
                 Dim definition As String = NormalizeLines(entry.Definition).TrimEnd()
                 Dim content As String = header & definition & vbCrLf & "GO" & vbCrLf
                 Dim hash As String = WriteVerified(filePath, content, utf16Le)
+                longestRelativePath = Math.Max(longestRelativePath, Path.Combine(relativeFolder, fileName).Length)
                 verificationLines.Add("[" & row.DatabaseName & "] " & kind & " " & objectLabel & " | " & Path.Combine(relativeFolder, fileName) & " | SHA256 " & hash)
                 savedObjects.Add("[" & row.DatabaseName & "] " & kind & " " & objectLabel)
                 savedCount += 1
@@ -543,6 +548,7 @@ Friend NotInheritable Class BackupService
                 Dim hash As String = WriteVerified(Path.Combine(stagingFolder, relativePath),
                                                    RestoreScriptBuilder.Build(databaseName, request.Server, objects, backupTime), utf16Le)
                 restoreScripts.Add(relativePath)
+                longestRelativePath = Math.Max(longestRelativePath, relativePath.Length)
                 verificationLines.Add("[" & databaseName & "] Script de reversion | " & relativePath & " | SHA256 " & hash)
             Next
 
@@ -576,7 +582,7 @@ Friend NotInheritable Class BackupService
                               New UTF8Encoding(False))
 
             cancellation.ThrowIfCancellationRequested()
-            Directory.Move(stagingFolder, finalFolder)
+            Directory.Move(stagingFolder, LongPath(finalFolder))
         Finally
             If Directory.Exists(stagingFolder) Then Directory.Delete(stagingFolder, True)
         End Try
@@ -586,8 +592,20 @@ Friend NotInheritable Class BackupService
             .SavedObjects = savedObjects,
             .Skipped = skipped,
             .VerifiedFiles = verificationLines.Count,
-            .RestoreScripts = restoreScripts
+            .RestoreScripts = restoreScripts,
+            .LongestPath = finalFolder.Length + 1 + longestRelativePath
         }
+    End Function
+
+    ' Limite clasico de Windows para rutas completas; por encima, algunos programas no abren los archivos.
+    Friend Const ClassicMaxPath As Integer = 259
+
+    ' Prefijo \\?\: Windows acepta rutas de mas de 260 caracteres sin depender de la configuracion del equipo.
+    Friend Shared Function LongPath(value As String) As String
+        If value.StartsWith("\\?\", StringComparison.Ordinal) Then Return value
+        Dim full As String = Path.GetFullPath(value)
+        If full.StartsWith("\\", StringComparison.Ordinal) Then Return "\\?\UNC\" & full.Substring(2)
+        Return "\\?\" & full
     End Function
 
     Private Shared Function WriteVerified(filePath As String, content As String, encoding As Encoding) As String
@@ -607,9 +625,9 @@ Friend NotInheritable Class BackupService
     Private Shared ReadOnly StrictUtf8 As New UTF8Encoding(False, True)
 
     Private Shared Function ReadScript(filePath As String, ByRef hash As String) As String
-        Dim bytes As Byte() = File.ReadAllBytes(filePath)
+        Dim bytes As Byte() = File.ReadAllBytes(LongPath(filePath))
         Using sha As SHA256 = SHA256.Create()
-            hash = BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-", "")
+            hash =BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-", "")
         End Using
         Return DecodeScript(bytes)
     End Function
@@ -637,7 +655,7 @@ Friend NotInheritable Class BackupService
 
     Private Shared Function FileHash(filePath As String) As String
         Using sha As SHA256 = SHA256.Create()
-            Using stream As FileStream = File.OpenRead(filePath)
+            Using stream As FileStream = File.OpenRead(LongPath(filePath))
                 Return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "")
             End Using
         End Using
@@ -769,7 +787,8 @@ Friend NotInheritable Class BackupService
             If String.Equals(segment, "Respaldos", StringComparison.OrdinalIgnoreCase) OrElse
                segment.StartsWith("Respaldo_SP_", StringComparison.OrdinalIgnoreCase) OrElse
                segment.StartsWith("Respaldo_Objetos_", StringComparison.OrdinalIgnoreCase) OrElse
-               segment.StartsWith(".respaldo_temp_", StringComparison.OrdinalIgnoreCase) Then Return True
+               segment.StartsWith(".respaldo_temp_", StringComparison.OrdinalIgnoreCase) OrElse
+               segment.StartsWith(".rtmp_", StringComparison.OrdinalIgnoreCase) Then Return True
         Next
         Return False
     End Function

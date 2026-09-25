@@ -530,7 +530,14 @@ Friend NotInheritable Class MainForm
                          "Objetos omitidos: " & result.Skipped.Count.ToString() & vbCrLf &
                          "Script(s) de reversion: " & String.Join(", ", result.RestoreScripts) & vbCrLf & vbCrLf &
                          String.Join(vbCrLf, result.SavedObjects)
-        MessageBox.Show(Me, "Respaldo terminado y archivos verificados.", "Resultado", MessageBoxButtons.OK, MessageBoxIcon.Information)
+        Dim message As String = "Respaldo terminado y archivos verificados."
+        If result.LongestPath > BackupService.ClassicMaxPath Then
+            Dim warning As String = "Atencion: algunas rutas miden hasta " & result.LongestPath.ToString() & " caracteres (el limite clasico de Windows es 260). " &
+                                    "Los archivos se guardaron, pero el Explorador o SSMS podrian no abrirlos; conviene elegir una carpeta destino mas corta."
+            outputBox.Text = warning & vbCrLf & vbCrLf & outputBox.Text
+            message &= vbCrLf & vbCrLf & warning
+        End If
+        MessageBox.Show(Me, message, "Resultado", MessageBoxButtons.OK, If(result.LongestPath > BackupService.ClassicMaxPath, MessageBoxIcon.Warning, MessageBoxIcon.Information))
     End Sub
 End Class
 

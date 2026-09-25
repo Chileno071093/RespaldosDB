@@ -27,7 +27,7 @@ Friend Module TestSupport
 
     Friend Sub TryDeleteFolder(folder As String)
         Try
-            If folder IsNot Nothing AndAlso Directory.Exists(folder) Then Directory.Delete(folder, True)
+            If folder IsNot Nothing AndAlso Directory.Exists(BackupService.LongPath(folder)) Then Directory.Delete(BackupService.LongPath(folder), True)
         Catch ex As IOException
         Catch ex As UnauthorizedAccessException
         End Try

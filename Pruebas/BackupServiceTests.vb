@@ -168,6 +168,22 @@ Public Class BackupServiceTests
         StringAssert.Contains(File.ReadAllText(Path.Combine(result.Folder, "Objetos_no_respaldados.txt")), "[" & db2 & "] Procedimiento [dbo].[P_Año]")
     End Sub
 
+    ' Caso real: destino largo + subcarpeta por base + nombre de archivo largo superaban los 260 caracteres de Windows.
+    <TestMethod>
+    Public Sub RespaldarConRutasDeMasDe260Caracteres()
+        Dim longName As String = "Destino_con_un_nombre_muy_largo_para_superar_el_limite_de_rutas_de_Windows_" & New String("x"c, 60)
+        Dim destination As String = Path.Combine(workFolder, longName, "Gestor Tiempo Extra", "Fase 1")
+        Dim analysis As BackupAnalysis = BackupService.Analyze(fixture.NewRequest({db1, db2}, sourceFolder, destination), CancellationToken.None, Nothing)
+        Dim result As BackupResult = BackupService.Save(fixture.NewRequest({db1, db2}, sourceFolder, destination), analysis, analysis.Items.Where(Function(x) x.CanBackup).Select(Function(x) x.Key), CancellationToken.None, Nothing)
+        Dim saved As String = Path.Combine(result.Folder, db1, "Procedimientos", "[dbo].[P_Año]_" & db1 & ".sql")
+        Assert.IsTrue(saved.Length > 260, "La prueba debe superar el limite: " & saved.Length.ToString())
+        Assert.IsTrue(File.Exists(BackupService.LongPath(saved)))
+        StringAssert.Contains(File.ReadAllText(BackupService.LongPath(saved)), "N'ñ'")
+        Assert.IsTrue(result.LongestPath > 260)
+        ' No quedan carpetas temporales.
+        Assert.AreEqual(0, Directory.GetDirectories(BackupService.LongPath(destination), ".*").Length)
+    End Sub
+
     <TestMethod>
     Public Sub RespaldarVerificaSoloLosArchivosSeleccionados()
         Dim analysis As BackupAnalysis = BackupService.Analyze(Request(db1), CancellationToken.None, Nothing)
