@@ -206,19 +206,7 @@ Friend NotInheritable Class BackupService
         Try
             Try
                 connection = OpenConnection(request, request.Database, cancellation)
-                Using command As SqlCommand = connection.CreateCommand()
-                    command.CommandTimeout = 10
-                    command.CommandText = "SELECT name FROM sys.databases WHERE state = 0 AND database_id > 4 AND HAS_DBACCESS(name) = 1 ORDER BY name;"
-                    Using registration As CancellationTokenRegistration = cancellation.Register(Sub() CancelCommand(command))
-                        cancellation.ThrowIfCancellationRequested()
-                        Using reader As SqlDataReader = command.ExecuteReader()
-                            While reader.Read()
-                                cancellation.ThrowIfCancellationRequested()
-                                databases.Add(reader.GetString(0))
-                            End While
-                        End Using
-                    End Using
-                End Using
+                databases.AddRange(ReadDatabaseNames(connection, cancellation))
             Catch ex As SqlException
                 cancellation.ThrowIfCancellationRequested()
                 Throw
@@ -305,6 +293,37 @@ Friend NotInheritable Class BackupService
             .ScannedDatabases = scanned,
             .DatabaseTimings = timings
         }
+    End Function
+
+    ' Bases de usuario en linea a las que el login tiene acceso. Se conecta a master, asi que no hace falta elegir una base antes.
+    Public Shared Function ListDatabases(request As BackupRequest, cancellation As CancellationToken) As List(Of String)
+        cancellation.ThrowIfCancellationRequested()
+        Try
+            Using connection As SqlConnection = OpenConnection(request, "master", cancellation)
+                Return ReadDatabaseNames(connection, cancellation)
+            End Using
+        Catch ex As SqlException
+            cancellation.ThrowIfCancellationRequested()
+            Throw
+        End Try
+    End Function
+
+    Private Shared Function ReadDatabaseNames(connection As SqlConnection, cancellation As CancellationToken) As List(Of String)
+        Dim databases As New List(Of String)()
+        Using command As SqlCommand = connection.CreateCommand()
+            command.CommandTimeout = 10
+            command.CommandText = "SELECT name FROM sys.databases WHERE state = 0 AND database_id > 4 AND HAS_DBACCESS(name) = 1 ORDER BY name;"
+            Using registration As CancellationTokenRegistration = cancellation.Register(Sub() CancelCommand(command))
+                cancellation.ThrowIfCancellationRequested()
+                Using reader As SqlDataReader = command.ExecuteReader()
+                    While reader.Read()
+                        cancellation.ThrowIfCancellationRequested()
+                        databases.Add(reader.GetString(0))
+                    End While
+                End Using
+            End Using
+        End Using
+        Return databases
     End Function
 
     Private Shared Function OpenConnection(request As BackupRequest, databaseName As String, cancellation As CancellationToken) As SqlConnection

@@ -14,7 +14,8 @@ Friend NotInheritable Class MainForm
     Inherits Form
 
     Private ReadOnly serverBox As New TextBox()
-    Private ReadOnly databaseBox As New TextBox()
+    Private ReadOnly databaseBox As New ComboBox()
+    Private ReadOnly loadDatabasesButton As New Button()
     Private ReadOnly userBox As New TextBox()
     Private ReadOnly passwordBox As New TextBox()
     Private ReadOnly sourceBox As New TextBox()
@@ -37,6 +38,7 @@ Friend NotInheritable Class MainForm
     Private analysis As BackupAnalysis
     Private busy As Boolean
     Private suppressRefresh As Boolean
+    Private updatingDatabaseList As Boolean
     Private operationCancellation As CancellationTokenSource
 
     Public Sub New()
@@ -71,9 +73,17 @@ Friend NotInheritable Class MainForm
             inputs.RowStyles.Add(New RowStyle(SizeType.Absolute, 44.0F))
         Next
         AddInput(inputs, 0, "Servidor SQL", serverBox, Nothing)
-        AddInput(inputs, 1, "Base de datos", databaseBox, Nothing)
-        AddInput(inputs, 2, "Usuario SQL", userBox, Nothing)
-        AddInput(inputs, 3, "Password SQL", passwordBox, Nothing)
+        ' La base va despues de usuario y password: con esos datos se carga la lista de bases.
+        databaseBox.DropDownStyle = ComboBoxStyle.DropDown
+        databaseBox.AutoCompleteMode = AutoCompleteMode.SuggestAppend
+        databaseBox.AutoCompleteSource = AutoCompleteSource.ListItems
+        databaseBox.MaxDropDownItems = 20
+        loadDatabasesButton.Text = "Cargar bases"
+        loadDatabasesButton.Dock = DockStyle.Fill
+        AddHandler loadDatabasesButton.Click, AddressOf LoadDatabasesClicked
+        AddInput(inputs, 1, "Usuario SQL", userBox, Nothing)
+        AddInput(inputs, 2, "Password SQL", passwordBox, Nothing)
+        AddInput(inputs, 3, "Base de datos", databaseBox, loadDatabasesButton)
 
         Dim sourceButton As New Button With {.Text = "Examinar...", .Dock = DockStyle.Fill}
         AddHandler sourceButton.Click, Sub(sender, e) BrowseFolder(sourceBox)
@@ -141,7 +151,7 @@ Friend NotInheritable Class MainForm
         Me.Controls.Add(root)
         ApplySettings(UserSettings.Load(UserSettings.DefaultPath))
 
-        For Each box As TextBox In {serverBox, databaseBox, userBox, passwordBox, sourceBox, destinationBox}
+        For Each box As Control In New Control() {serverBox, databaseBox, userBox, passwordBox, sourceBox, destinationBox}
             AddHandler box.TextChanged, AddressOf InputsChanged
         Next
         AddHandler includeSubfoldersBox.CheckedChanged, AddressOf InputsChanged
@@ -204,7 +214,7 @@ Friend NotInheritable Class MainForm
         AddHandler objectsGrid.SelectionChanged, Sub(sender, e) RefreshActionButtons()
     End Sub
 
-    Private Shared Sub AddInput(table As TableLayoutPanel, row As Integer, labelText As String, box As TextBox, button As Button)
+    Private Shared Sub AddInput(table As TableLayoutPanel, row As Integer, labelText As String, box As Control, button As Button)
         Dim label As New Label With {.Text = labelText, .AutoSize = True, .Anchor = AnchorStyles.Left}
         box.Dock = DockStyle.Fill
         box.Margin = New Padding(3, 8, 3, 8)
@@ -224,6 +234,7 @@ Friend NotInheritable Class MainForm
     End Sub
 
     Private Sub InputsChanged(sender As Object, e As EventArgs)
+        If updatingDatabaseList Then Return
         analysis = Nothing
         objectsGrid.Rows.Clear()
         summaryLabel.Text = "Los datos cambiaron. Pulsa Analizar de nuevo."
@@ -301,8 +312,15 @@ Friend NotInheritable Class MainForm
         RefreshActionButtons()
     End Sub
 
-    Private Function CreateRequest() As BackupRequest
-        If String.IsNullOrWhiteSpace(serverBox.Text) OrElse
+    ' connectionOnly: solo se necesitan servidor, usuario y password (por ejemplo, para listar las bases).
+    Private Function CreateRequest(connectionOnly As Boolean) As BackupRequest
+        If connectionOnly Then
+            If String.IsNullOrWhiteSpace(serverBox.Text) OrElse
+               String.IsNullOrWhiteSpace(userBox.Text) OrElse
+               String.IsNullOrEmpty(passwordBox.Text) Then
+                Throw New InvalidOperationException("Completa servidor, usuario y password.")
+            End If
+        ElseIf String.IsNullOrWhiteSpace(serverBox.Text) OrElse
            String.IsNullOrWhiteSpace(databaseBox.Text) OrElse
            String.IsNullOrWhiteSpace(userBox.Text) OrElse
            String.IsNullOrEmpty(passwordBox.Text) OrElse
@@ -335,11 +353,12 @@ Friend NotInheritable Class MainForm
                                                            errorPrefix As String,
                                                            errorTitle As String,
                                                            work As Func(Of BackupRequest, CancellationToken, IProgress(Of String), T),
-                                                           Optional onError As Action = Nothing) As Task(Of T)
+                                                           Optional onError As Action = Nothing,
+                                                           Optional connectionOnly As Boolean = False) As Task(Of T)
         Dim request As BackupRequest = Nothing
         Dim cancellation As CancellationTokenSource = Nothing
         Try
-            request = CreateRequest()
+            request = CreateRequest(connectionOnly)
             cancellation = New CancellationTokenSource()
             SetBusy(True, cancellation)
             outputBox.Text = startMessage
@@ -366,6 +385,44 @@ Friend NotInheritable Class MainForm
         inputs.Enabled = Not value
         optionsPanel.Enabled = Not value
         RefreshActionButtons()
+    End Sub
+
+    Private Async Sub LoadDatabasesClicked(sender As Object, e As EventArgs)
+        Dim names As List(Of String) = Await RunOperationAsync(Of List(Of String))(
+            "Conectando al servidor y obteniendo las bases de datos...",
+            "Carga de bases cancelada.",
+            "No se pudieron obtener las bases: ", "Error de conexion",
+            Function(request, token, progress) BackupService.ListDatabases(request, token),
+            connectionOnly:=True)
+        If names Is Nothing Then Return
+
+        ' Rellenar la lista no debe invalidar la vista previa si la base elegida no cambia.
+        Dim current As String = databaseBox.Text.Trim()
+        Dim match As String = names.FirstOrDefault(Function(x) String.Equals(x, current, StringComparison.OrdinalIgnoreCase))
+        updatingDatabaseList = True
+        Try
+            databaseBox.BeginUpdate()
+            databaseBox.Items.Clear()
+            databaseBox.Items.AddRange(names.Cast(Of Object)().ToArray())
+            databaseBox.EndUpdate()
+            If match IsNot Nothing Then
+                databaseBox.SelectedItem = match
+            Else
+                databaseBox.Text = current
+            End If
+        Finally
+            updatingDatabaseList = False
+        End Try
+
+        If names.Count = 0 Then
+            outputBox.Text = "Conexion correcta, pero el usuario no tiene acceso a ninguna base de datos de usuario."
+        ElseIf match IsNot Nothing Then
+            outputBox.Text = "Conexion correcta: " & names.Count.ToString() & " base(s) disponible(s). Se mantiene " & match & "."
+        Else
+            outputBox.Text = "Conexion correcta: " & names.Count.ToString() & " base(s) disponible(s). Elige una en la lista 'Base de datos'."
+            databaseBox.Focus()
+            databaseBox.DroppedDown = True
+        End If
     End Sub
 
     Private Async Sub AnalyzeClicked(sender As Object, e As EventArgs)
