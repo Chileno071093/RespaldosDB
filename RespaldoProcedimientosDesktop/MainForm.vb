@@ -36,6 +36,8 @@ Friend NotInheritable Class MainForm
     Private ReadOnly outputBox As New TextBox()
     Private ReadOnly inputs As New TableLayoutPanel()
     Private analysis As BackupAnalysis
+    Private Const ChangesColumn As Integer = 6
+    Private Shared ReadOnly ChangedColor As Color = Color.FromArgb(178, 0, 0)
     Private busy As Boolean
     Private suppressRefresh As Boolean
     Private operationCancellation As CancellationTokenSource
@@ -204,10 +206,12 @@ Friend NotInheritable Class MainForm
         objectsGrid.Columns.Add(New DataGridViewTextBoxColumn With {.HeaderText = "Objeto declarado", .Width = 250, .ReadOnly = True})
         objectsGrid.Columns.Add(New DataGridViewTextBoxColumn With {.HeaderText = "Archivo", .Width = 220, .ReadOnly = True})
         objectsGrid.Columns.Add(New DataGridViewTextBoxColumn With {.HeaderText = "Estado", .Width = 160, .ReadOnly = True})
+        objectsGrid.Columns.Add(New DataGridViewTextBoxColumn With {.HeaderText = "Cambios", .Width = 110, .ReadOnly = True, .ToolTipText = "Script frente a la definicion actual en SQL Server (lineas quitadas y agregadas)"})
         objectsGrid.Columns.Add(New DataGridViewTextBoxColumn With {.HeaderText = "Detalle", .AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, .ReadOnly = True})
         AddHandler objectsGrid.CurrentCellDirtyStateChanged, AddressOf GridDirtyStateChanged
         AddHandler objectsGrid.CellValueChanged, Sub(sender, e) RefreshActionButtons()
         AddHandler objectsGrid.SelectionChanged, Sub(sender, e) RefreshActionButtons()
+        AddHandler objectsGrid.CellFormatting, AddressOf GridCellFormatting
     End Sub
 
     Private Shared Sub AddInput(table As TableLayoutPanel, row As Integer, labelText As String, box As Control, button As Button)
@@ -235,6 +239,13 @@ Friend NotInheritable Class MainForm
         summaryLabel.Text = "Los datos cambiaron. Pulsa Analizar de nuevo."
         outputBox.Text = "La vista previa anterior ya no corresponde a estos datos."
         RefreshActionButtons()
+    End Sub
+
+    ' Colorea "Cambios" al pintar (solo celdas visibles); un estilo por celda vuelve lenta la grilla con miles de filas.
+    Private Sub GridCellFormatting(sender As Object, e As DataGridViewCellFormattingEventArgs)
+        If e.ColumnIndex <> ChangesColumn OrElse e.RowIndex < 0 Then Return
+        Dim item As AnalysisItem = TryCast(objectsGrid.Rows(e.RowIndex).Tag, AnalysisItem)
+        If item IsNot Nothing AndAlso item.HasChanges Then e.CellStyle.ForeColor = ChangedColor
     End Sub
 
     Private Sub GridDirtyStateChanged(sender As Object, e As EventArgs)
@@ -267,14 +278,17 @@ Friend NotInheritable Class MainForm
     End Function
 
     Private Sub SetAllSelection(value As Boolean)
-        ' Evita recalcular los botones por cada celda (CellValueChanged) al marcar muchas filas.
+        ' Evita recalcular los botones (CellValueChanged) y el alto de cada fila por cada casilla al marcar muchas filas.
         suppressRefresh = True
+        Dim sizing As DataGridViewAutoSizeRowsMode = objectsGrid.AutoSizeRowsMode
+        objectsGrid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.None
         Try
             For Each row As DataGridViewRow In objectsGrid.Rows
                 Dim item As AnalysisItem = TryCast(row.Tag, AnalysisItem)
                 If item IsNot Nothing AndAlso item.CanBackup Then row.Cells(0).Value = value
             Next
         Finally
+            objectsGrid.AutoSizeRowsMode = sizing
             suppressRefresh = False
         End Try
         RefreshActionButtons()
@@ -291,7 +305,7 @@ Friend NotInheritable Class MainForm
                 Dim fileLabel As String = Path.GetFileName(item.Declaration.SourceFile)
                 If item.AlsoDeclaredIn IsNot Nothing AndAlso item.AlsoDeclaredIn.Count > 0 Then fileLabel &= " (+" & item.AlsoDeclaredIn.Count.ToString() & ")"
                 Dim gridRow As New DataGridViewRow()
-                gridRow.CreateCells(objectsGrid, item.CanBackup, item.DatabaseName, item.Declaration.Kind, item.Declaration.DisplayName(), fileLabel, item.Status, item.Detail)
+                gridRow.CreateCells(objectsGrid, item.CanBackup, item.DatabaseName, item.Declaration.Kind, item.Declaration.DisplayName(), fileLabel, item.Status, If(item.ChangeSummary, ""), item.Detail)
                 gridRow.Tag = item
                 newRows.Add(gridRow)
             Next
@@ -440,7 +454,8 @@ Friend NotInheritable Class MainForm
         Dim ready As Integer = result.Items.Where(Function(x) x.CanBackup).Count()
         Dim databaseCount As Integer = result.Items.Select(Function(x) x.DatabaseName).Distinct(StringComparer.OrdinalIgnoreCase).Count()
         summaryLabel.Text = result.Items.Count.ToString() & " filas (objeto por base) en " & databaseCount.ToString() & " base(s); " &
-                            ready.ToString() & " listas; " & (result.Items.Count - ready).ToString() & " requieren revision."
+                            ready.ToString() & " listas (" & result.Items.Where(Function(x) x.HasChanges).Count().ToString() & " con cambios); " &
+                            (result.Items.Count - ready).ToString() & " requieren revision."
         outputBox.Text = "Marca objetos para el respaldo. Selecciona filas (Ctrl/Shift) para Comparar o Buscar en bases."
         If result.FilesWithoutObject.Count > 0 Then
             outputBox.AppendText(vbCrLf & result.FilesWithoutObject.Count.ToString() & " archivo(s) .sql sin declaraciones reconocidas.")
@@ -512,7 +527,8 @@ Friend NotInheritable Class MainForm
         outputBox.Text = "Respaldo creado: " & result.Folder & vbCrLf &
                          "Objetos guardados: " & result.SavedObjects.Count.ToString() & vbCrLf &
                          "Archivos SQL verificados: " & result.VerifiedFiles.ToString() & vbCrLf &
-                         "Objetos omitidos: " & result.Skipped.Count.ToString() & vbCrLf & vbCrLf &
+                         "Objetos omitidos: " & result.Skipped.Count.ToString() & vbCrLf &
+                         "Script(s) de reversion: " & String.Join(", ", result.RestoreScripts) & vbCrLf & vbCrLf &
                          String.Join(vbCrLf, result.SavedObjects)
         MessageBox.Show(Me, "Respaldo terminado y archivos verificados.", "Resultado", MessageBoxButtons.OK, MessageBoxIcon.Information)
     End Sub

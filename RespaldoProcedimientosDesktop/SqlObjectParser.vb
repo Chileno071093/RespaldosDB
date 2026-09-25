@@ -11,6 +11,8 @@ Friend NotInheritable Class DeclaredObject
     Public Property ObjectName As String
     Public Property SourceFile As String
     Public Property CandidateText As String
+    ' Posicion del CREATE/ALTER dentro del script (lo previo suelen ser comentarios).
+    Public Property DeclarationStart As Integer
 
     Public Function DisplayName() As String
         Dim prefix As String = If(String.IsNullOrEmpty(SchemaName), "", "[" & SchemaName & "].")
@@ -48,6 +50,11 @@ Friend NotInheritable Class SqlObjectParser
             If Not IsWord(tokens(index), "CREATE") AndAlso Not IsWord(tokens(index), "ALTER") Then
                 Continue For
             End If
+            ' El ALTER de "CREATE OR ALTER" ya se proceso junto con su CREATE.
+            If IsWord(tokens(index), "ALTER") AndAlso index >= 2 AndAlso
+               IsWord(tokens(index - 1), "OR") AndAlso IsWord(tokens(index - 2), "CREATE") Then
+                Continue For
+            End If
 
             Dim position As Integer = index + 1
             If IsWord(tokens(index), "CREATE") AndAlso
@@ -78,7 +85,7 @@ Friend NotInheritable Class SqlObjectParser
                 parts.Add(tokens(position).Value)
             End While
 
-            Dim item As New DeclaredObject With {.Kind = kind, .SourceFile = sourceFile}
+            Dim item As New DeclaredObject With {.Kind = kind, .SourceFile = sourceFile, .DeclarationStart = tokens(index).Start}
             Dim batchEnd As Integer = FindBatchEnd(script, tokens, position + 1)
             item.CandidateText = script.Substring(tokens(index).Start, batchEnd - tokens(index).Start).Trim()
             Select Case parts.Count

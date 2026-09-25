@@ -51,6 +51,7 @@
     <Compile Include="BackupService.vb" />
     <Compile Include="UserSettings.vb" />
     <Compile Include="DiffService.vb" />
+    <Compile Include="RestoreScriptBuilder.vb" />
     <Compile Include="DatabasePickerForm.vb">
       <SubType>Form</SubType>
     </Compile>

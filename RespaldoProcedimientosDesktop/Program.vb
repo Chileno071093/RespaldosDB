@@ -1,5 +1,8 @@
 Imports System
+Imports System.Runtime.CompilerServices
 Imports System.Windows.Forms
+
+<Assembly: InternalsVisibleTo("RespaldoProcedimientosDesktop.Tests")>
 
 Friend Module Program
     <STAThread>

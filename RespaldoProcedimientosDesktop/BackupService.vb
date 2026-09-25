@@ -41,6 +41,9 @@ Friend NotInheritable Class AnalysisItem
     Public Property Status As String
     Public Property Detail As String
     Public Property AlsoDeclaredIn As List(Of DeclaredObject)
+    ' Resultado de comparar el script con la definicion actual: "Iguales", "-3 +5" o vacio si no hay definicion.
+    Public Property ChangeSummary As String
+    Public Property HasChanges As Boolean
 
     Public ReadOnly Property CanBackup As Boolean
         Get
@@ -61,6 +64,7 @@ Friend NotInheritable Class BackupResult
     Public Property SavedObjects As List(Of String)
     Public Property Skipped As List(Of String)
     Public Property VerifiedFiles As Integer
+    Public Property RestoreScripts As List(Of String)
 End Class
 
 Friend NotInheritable Class DatabaseLocation
@@ -211,6 +215,19 @@ Friend NotInheritable Class BackupService
             Else
                 row.Status = "Listo"
                 row.Detail = "Definicion actual disponible para respaldo."
+                SummarizeChanges(row)
+            End If
+        End If
+    End Sub
+
+    Private Shared Sub SummarizeChanges(row As AnalysisItem)
+        Dim diff As DiffResult = DiffService.Compare(row.Current.Definition, row.Declaration.CandidateText, False)
+        row.HasChanges = diff.HasDifferences
+        row.ChangeSummary = If(diff.HasDifferences, "-" & diff.Removed.ToString() & " +" & diff.Added.ToString(), "Iguales")
+        If row.AlsoDeclaredIn IsNot Nothing Then
+            Dim mainText As String = DiffService.DeclarationText(row.Declaration.CandidateText)
+            If row.AlsoDeclaredIn.Any(Function(x) DiffService.DeclarationText(x.CandidateText) <> mainText) Then
+                row.ChangeSummary &= " (varia por archivo)"
             End If
         End If
     End Sub
@@ -433,13 +450,15 @@ Friend NotInheritable Class BackupService
         ' Con una sola base se conserva la estructura de siempre; con varias, una subcarpeta por base.
         Dim perDatabaseFolders As Boolean = databaseNames.Count > 1
         Dim destinationRoot As String = Path.GetFullPath(request.DestinationFolder)
-        Dim finalFolder As String = Path.Combine(destinationRoot, "Respaldo_Objetos_" & DateTime.Now.ToString("yyyyMMdd_HHmmss"))
+        Dim backupTime As DateTime = DateTime.Now
+        Dim finalFolder As String = Path.Combine(destinationRoot, "Respaldo_Objetos_" & backupTime.ToString("yyyyMMdd_HHmmss"))
         If Directory.Exists(finalFolder) Then Throw New IOException("La carpeta de salida ya existe: " & finalFolder)
         Directory.CreateDirectory(destinationRoot)
         Dim stagingFolder As String = Path.Combine(destinationRoot, ".respaldo_temp_" & Guid.NewGuid().ToString("N"))
         Dim utf16Le As New UnicodeEncoding(False, True)
         Dim savedObjects As New List(Of String)()
         Dim verificationLines As New List(Of String)()
+        Dim restoreScripts As New List(Of String)()
         Dim skipped As List(Of String) = analysis.Items.Where(Function(x) Not selectedSet.Contains(x.Key)).Select(Function(x) "[" & x.DatabaseName & "] " & x.Declaration.DisplayName() & " - " & x.Status).ToList()
 
         Try
@@ -473,6 +492,18 @@ Friend NotInheritable Class BackupService
                 verificationLines.Add("[" & row.DatabaseName & "] " & kind & " " & objectLabel & " | " & Path.Combine(relativeFolder, fileName) & " | SHA256 " & hash)
                 savedObjects.Add("[" & row.DatabaseName & "] " & kind & " " & objectLabel)
                 savedCount += 1
+            Next
+
+            cancellation.ThrowIfCancellationRequested()
+            If progress IsNot Nothing Then progress.Report("Generando scripts de reversion...")
+            For Each databaseName As String In databaseNames
+                cancellation.ThrowIfCancellationRequested()
+                Dim objects As IEnumerable(Of CatalogObject) = selected.Where(Function(x) String.Equals(x.DatabaseName, databaseName, StringComparison.OrdinalIgnoreCase)).Select(Function(x) x.Current)
+                Dim relativePath As String = Path.Combine(If(perDatabaseFolders, SafeFileName(databaseName), ""), SafeFileName("Restaurar_" & databaseName & ".sql"))
+                Dim hash As String = WriteVerified(Path.Combine(stagingFolder, relativePath),
+                                                   RestoreScriptBuilder.Build(databaseName, request.Server, objects, backupTime), utf16Le)
+                restoreScripts.Add(relativePath)
+                verificationLines.Add("[" & databaseName & "] Script de reversion | " & relativePath & " | SHA256 " & hash)
             Next
 
             cancellation.ThrowIfCancellationRequested()
@@ -514,7 +545,8 @@ Friend NotInheritable Class BackupService
             .Folder = finalFolder,
             .SavedObjects = savedObjects,
             .Skipped = skipped,
-            .VerifiedFiles = verificationLines.Count
+            .VerifiedFiles = verificationLines.Count,
+            .RestoreScripts = restoreScripts
         }
     End Function
 

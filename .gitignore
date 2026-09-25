@@ -13,6 +13,9 @@
 *.userosscache
 *.sln.docstates
 
+# Resultados de pruebas
+TestResults/
+
 # Paquetes NuGet
 packages/
 *.nupkg
