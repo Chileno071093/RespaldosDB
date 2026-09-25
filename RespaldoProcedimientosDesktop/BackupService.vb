@@ -13,7 +13,7 @@ Imports Microsoft.VisualBasic
 
 Friend NotInheritable Class BackupRequest
     Public Property Server As String
-    Public Property Database As String
+    Public Property Databases As List(Of String)
     Public Property UserName As String
     ''' <summary>Debe ser de solo lectura (MakeReadOnly); quien crea la solicitud la libera al terminar.</summary>
     Public Property Password As SecureString
@@ -35,6 +35,7 @@ End Class
 
 Friend NotInheritable Class AnalysisItem
     Public Property Key As String
+    Public Property DatabaseName As String
     Public Property Declaration As DeclaredObject
     Public Property Current As CatalogObject
     Public Property Status As String
@@ -133,44 +134,50 @@ Friend NotInheritable Class BackupService
             Throw New InvalidOperationException("No se encontraron declaraciones CREATE o ALTER de procedimientos, vistas, triggers o funciones en los archivos .sql.")
         End If
 
-        cancellation.ThrowIfCancellationRequested()
-        If progress IsNot Nothing Then progress.Report("Consultando en SQL Server solo los nombres detectados...")
-        Dim names As List(Of String) = declared.Values.Where(Function(x) String.IsNullOrEmpty(x.DatabaseName) OrElse String.Equals(x.DatabaseName, request.Database, StringComparison.OrdinalIgnoreCase)).Select(Function(x) x.ObjectName).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
-        Dim catalog As List(Of CatalogObject) = ReadCatalog(request, names, cancellation, progress)
+        Dim databases As List(Of String) = request.Databases
+        If databases Is Nothing OrElse databases.Count = 0 Then Throw New InvalidOperationException("Indica al menos una base de datos.")
+        Dim ordered As List(Of KeyValuePair(Of String, DeclaredObject)) = declared.OrderBy(Function(x) x.Value.DisplayName()).ToList()
         Dim rows As New List(Of AnalysisItem)()
-        For Each pair As KeyValuePair(Of String, DeclaredObject) In declared.OrderBy(Function(x) x.Value.DisplayName())
+        Dim failures As New List(Of SqlException)()
+        For databaseIndex As Integer = 0 To databases.Count - 1
             cancellation.ThrowIfCancellationRequested()
-            Dim item As DeclaredObject = pair.Value
-            Dim others As List(Of DeclaredObject) = Nothing
-            If Not duplicates.TryGetValue(pair.Key, others) Then others = New List(Of DeclaredObject)()
-            Dim row As New AnalysisItem With {.Key = pair.Key, .Declaration = item, .AlsoDeclaredIn = others}
-            If Not String.IsNullOrEmpty(item.DatabaseName) AndAlso
-               Not String.Equals(item.DatabaseName, request.Database, StringComparison.OrdinalIgnoreCase) Then
-                row.Status = "Otra base"
-                row.Detail = "El nombre declarado apunta a [" & item.DatabaseName & "]."
-            Else
-                Dim candidates As List(Of CatalogObject) = catalog.Where(Function(x) Matches(item, x)).ToList()
-                If candidates.Count = 0 Then
-                    row.Status = "No visible o inexistente"
-                    row.Detail = "Con este usuario no es posible distinguir falta de permisos de ausencia del objeto."
-                ElseIf candidates.Count > 1 Then
-                    row.Status = "Ambiguo"
-                    row.Detail = "Hay varios esquemas con ese nombre; indica el esquema en el script."
+            Dim databaseName As String = databases(databaseIndex)
+            ' Una declaracion con base explicita ([Base].[esquema].[objeto]) solo se revisa en esa base.
+            Dim targets As List(Of KeyValuePair(Of String, DeclaredObject)) = ordered.Where(Function(x) String.IsNullOrEmpty(x.Value.DatabaseName) OrElse String.Equals(x.Value.DatabaseName, databaseName, StringComparison.OrdinalIgnoreCase)).ToList()
+            If targets.Count = 0 Then Continue For
+            If progress IsNot Nothing Then progress.Report("Consultando base " & (databaseIndex + 1).ToString() & "/" & databases.Count.ToString() & ": " & databaseName & "...")
+            Dim names As List(Of String) = targets.Select(Function(x) x.Value.ObjectName).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
+            Dim catalog As List(Of CatalogObject) = Nothing
+            Dim failure As SqlException = Nothing
+            Try
+                catalog = ReadCatalog(request, databaseName, names, cancellation, progress)
+            Catch ex As SqlException
+                cancellation.ThrowIfCancellationRequested()
+                failures.Add(ex)
+                failure = ex
+            End Try
+            For Each pair As KeyValuePair(Of String, DeclaredObject) In targets
+                cancellation.ThrowIfCancellationRequested()
+                Dim row As AnalysisItem = NewRow(databaseName, pair, duplicates)
+                If failure IsNot Nothing Then
+                    row.Status = "Base no disponible"
+                    row.Detail = failure.Message
                 Else
-                    row.Current = candidates(0)
-                    If row.Current.Definition Is Nothing Then
-                        row.Status = "Sin definicion"
-                        row.Detail = "El objeto existe, pero la definicion esta cifrada o no es visible."
-                    Else
-                        row.Status = "Listo"
-                        row.Detail = "Definicion actual disponible para respaldo."
-                    End If
+                    ClassifyRow(row, catalog)
                 End If
-            End If
-            If others.Count > 0 Then
-                row.Detail &= " Declarado tambien en: " & String.Join(", ", others.Select(Function(x) Path.GetFileName(x.SourceFile))) & " (usa Comparar para revisar cada archivo)."
-            End If
-            rows.Add(row)
+                rows.Add(AppendDuplicateDetail(row))
+            Next
+        Next
+        ' Si ninguna base respondio (p. ej. password incorrecto), se informa el error como antes.
+        If failures.Count > 0 AndAlso failures.Count = databases.Count Then Throw failures(0)
+
+        For Each pair As KeyValuePair(Of String, DeclaredObject) In ordered
+            Dim item As DeclaredObject = pair.Value
+            If String.IsNullOrEmpty(item.DatabaseName) OrElse databases.Contains(item.DatabaseName, StringComparer.OrdinalIgnoreCase) Then Continue For
+            Dim row As AnalysisItem = NewRow(item.DatabaseName, pair, duplicates)
+            row.Status = "Otra base"
+            row.Detail = "El nombre declarado apunta a [" & item.DatabaseName & "], que no esta entre las bases seleccionadas."
+            rows.Add(AppendDuplicateDetail(row))
         Next
 
         cancellation.ThrowIfCancellationRequested()
@@ -180,6 +187,39 @@ Friend NotInheritable Class BackupService
             .DetectedDeclarations = detectedDeclarations,
             .SourceHashes = sourceHashes
         }
+    End Function
+
+    Private Shared Function NewRow(databaseName As String, pair As KeyValuePair(Of String, DeclaredObject), duplicates As Dictionary(Of String, List(Of DeclaredObject))) As AnalysisItem
+        Dim others As List(Of DeclaredObject) = Nothing
+        If Not duplicates.TryGetValue(pair.Key, others) Then others = New List(Of DeclaredObject)()
+        Return New AnalysisItem With {.Key = databaseName & "|" & pair.Key, .DatabaseName = databaseName, .Declaration = pair.Value, .AlsoDeclaredIn = others}
+    End Function
+
+    Private Shared Sub ClassifyRow(row As AnalysisItem, catalog As List(Of CatalogObject))
+        Dim candidates As List(Of CatalogObject) = catalog.Where(Function(x) Matches(row.Declaration, x)).ToList()
+        If candidates.Count = 0 Then
+            row.Status = "No visible o inexistente"
+            row.Detail = "Con este usuario no es posible distinguir falta de permisos de ausencia del objeto."
+        ElseIf candidates.Count > 1 Then
+            row.Status = "Ambiguo"
+            row.Detail = "Hay varios esquemas con ese nombre; indica el esquema en el script."
+        Else
+            row.Current = candidates(0)
+            If row.Current.Definition Is Nothing Then
+                row.Status = "Sin definicion"
+                row.Detail = "El objeto existe, pero la definicion esta cifrada o no es visible."
+            Else
+                row.Status = "Listo"
+                row.Detail = "Definicion actual disponible para respaldo."
+            End If
+        End If
+    End Sub
+
+    Private Shared Function AppendDuplicateDetail(row As AnalysisItem) As AnalysisItem
+        If row.AlsoDeclaredIn.Count > 0 Then
+            row.Detail &= " Declarado tambien en: " & String.Join(", ", row.AlsoDeclaredIn.Select(Function(x) Path.GetFileName(x.SourceFile))) & " (usa Comparar para revisar cada archivo)."
+        End If
+        Return row
     End Function
 
     Public Shared Function FindDatabases(request As BackupRequest, selectedObjects As IEnumerable(Of DeclaredObject), cancellation As CancellationToken, progress As IProgress(Of String)) As DatabaseSearchReport
@@ -205,7 +245,7 @@ Friend NotInheritable Class BackupService
         Dim connection As SqlConnection = Nothing
         Try
             Try
-                connection = OpenConnection(request, request.Database, cancellation)
+                connection = OpenConnection(request, "master", cancellation)
                 databases.AddRange(ReadDatabaseNames(connection, cancellation))
             Catch ex As SqlException
                 cancellation.ThrowIfCancellationRequested()
@@ -373,49 +413,55 @@ Friend NotInheritable Class BackupService
         Next
 
         If progress IsNot Nothing Then progress.Report("Verificando las definiciones seleccionadas en SQL Server...")
-        Dim currentCatalog As List(Of CatalogObject) = ReadCatalog(request, selected.Select(Function(x) x.Current.ObjectName), cancellation, progress)
-        For Each row As AnalysisItem In selected
-            cancellation.ThrowIfCancellationRequested()
-            Dim matchesNow As List(Of CatalogObject) = currentCatalog.Where(Function(x) ExactMatch(row.Current, x)).ToList()
-            If matchesNow.Count <> 1 OrElse matchesNow(0).Definition Is Nothing Then
-                Throw New InvalidOperationException("El objeto " & row.Declaration.DisplayName() & " ya no esta disponible. Vuelve a analizar.")
-            End If
-            Dim now As CatalogObject = matchesNow(0)
-            If Not String.Equals(row.Current.Definition, now.Definition, StringComparison.Ordinal) OrElse
-               row.Current.AnsiNulls <> now.AnsiNulls OrElse row.Current.QuotedIdentifier <> now.QuotedIdentifier Then
-                Throw New InvalidOperationException("La definicion de " & row.Declaration.DisplayName() & " cambio desde la vista previa. Vuelve a analizar.")
-            End If
+        For Each group As IGrouping(Of String, AnalysisItem) In selected.GroupBy(Function(x) x.DatabaseName, StringComparer.OrdinalIgnoreCase)
+            Dim currentCatalog As List(Of CatalogObject) = ReadCatalog(request, group.Key, group.Select(Function(x) x.Current.ObjectName), cancellation, progress)
+            For Each row As AnalysisItem In group
+                cancellation.ThrowIfCancellationRequested()
+                Dim matchesNow As List(Of CatalogObject) = currentCatalog.Where(Function(x) ExactMatch(row.Current, x)).ToList()
+                If matchesNow.Count <> 1 OrElse matchesNow(0).Definition Is Nothing Then
+                    Throw New InvalidOperationException("El objeto " & row.Declaration.DisplayName() & " de [" & row.DatabaseName & "] ya no esta disponible. Vuelve a analizar.")
+                End If
+                Dim now As CatalogObject = matchesNow(0)
+                If Not String.Equals(row.Current.Definition, now.Definition, StringComparison.Ordinal) OrElse
+                   row.Current.AnsiNulls <> now.AnsiNulls OrElse row.Current.QuotedIdentifier <> now.QuotedIdentifier Then
+                    Throw New InvalidOperationException("La definicion de " & row.Declaration.DisplayName() & " en [" & row.DatabaseName & "] cambio desde la vista previa. Vuelve a analizar.")
+                End If
+            Next
         Next
 
+        Dim databaseNames As List(Of String) = selected.Select(Function(x) x.DatabaseName).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(Function(x) x, StringComparer.OrdinalIgnoreCase).ToList()
+        ' Con una sola base se conserva la estructura de siempre; con varias, una subcarpeta por base.
+        Dim perDatabaseFolders As Boolean = databaseNames.Count > 1
         Dim destinationRoot As String = Path.GetFullPath(request.DestinationFolder)
         Dim finalFolder As String = Path.Combine(destinationRoot, "Respaldo_Objetos_" & DateTime.Now.ToString("yyyyMMdd_HHmmss"))
         If Directory.Exists(finalFolder) Then Throw New IOException("La carpeta de salida ya existe: " & finalFolder)
         Directory.CreateDirectory(destinationRoot)
         Dim stagingFolder As String = Path.Combine(destinationRoot, ".respaldo_temp_" & Guid.NewGuid().ToString("N"))
         Dim utf16Le As New UnicodeEncoding(False, True)
-        Dim quotedDatabase As String = "[" & request.Database.Replace("]", "]]") & "]"
         Dim savedObjects As New List(Of String)()
         Dim verificationLines As New List(Of String)()
-        Dim skipped As List(Of String) = analysis.Items.Where(Function(x) Not selectedSet.Contains(x.Key)).Select(Function(x) x.Declaration.DisplayName() & " - " & x.Status).ToList()
+        Dim skipped As List(Of String) = analysis.Items.Where(Function(x) Not selectedSet.Contains(x.Key)).Select(Function(x) "[" & x.DatabaseName & "] " & x.Declaration.DisplayName() & " - " & x.Status).ToList()
 
         Try
             cancellation.ThrowIfCancellationRequested()
             Directory.CreateDirectory(stagingFolder)
             Dim savedCount As Integer = 0
-            For Each row As AnalysisItem In selected.OrderBy(Function(x) x.Declaration.DisplayName())
+            For Each row As AnalysisItem In selected.OrderBy(Function(x) x.DatabaseName, StringComparer.OrdinalIgnoreCase).ThenBy(Function(x) x.Declaration.DisplayName())
                 cancellation.ThrowIfCancellationRequested()
-                If progress IsNot Nothing Then progress.Report("Guardando objeto " & (savedCount + 1).ToString() & "/" & selected.Count.ToString() & ": " & row.Declaration.DisplayName())
+                If progress IsNot Nothing Then progress.Report("Guardando objeto " & (savedCount + 1).ToString() & "/" & selected.Count.ToString() & ": [" & row.DatabaseName & "] " & row.Declaration.DisplayName())
                 Dim entry As CatalogObject = row.Current
                 Dim kind As String = KindName(entry.TypeCode)
-                Dim folder As String = Path.Combine(stagingFolder, FolderName(kind))
+                Dim relativeFolder As String = If(perDatabaseFolders, Path.Combine(SafeFileName(row.DatabaseName), FolderName(kind)), FolderName(kind))
+                Dim folder As String = Path.Combine(stagingFolder, relativeFolder)
                 Directory.CreateDirectory(folder)
                 Dim objectLabel As String = If(String.IsNullOrEmpty(entry.SchemaName),
                                                "[" & entry.ObjectName & "]",
                                                "[" & entry.SchemaName & "].[" & entry.ObjectName & "]")
-                Dim fileName As String = SafeFileName(objectLabel & "_" & request.Database & ".sql")
+                Dim fileName As String = SafeFileName(objectLabel & "_" & row.DatabaseName & ".sql")
                 Dim filePath As String = Path.Combine(folder, fileName)
-                If File.Exists(filePath) Then Throw New IOException("Nombre de archivo repetido para " & kind & " " & objectLabel)
+                If File.Exists(filePath) Then Throw New IOException("Nombre de archivo repetido para " & kind & " " & objectLabel & " en [" & row.DatabaseName & "]")
 
+                Dim quotedDatabase As String = "[" & row.DatabaseName.Replace("]", "]]") & "]"
                 Dim ansiValue As String = If(entry.AnsiNulls, "ON", "OFF")
                 Dim quotedValue As String = If(entry.QuotedIdentifier, "ON", "OFF")
                 Dim header As String = "USE " & quotedDatabase & vbCrLf & "GO" & vbCrLf &
@@ -424,8 +470,8 @@ Friend NotInheritable Class BackupService
                 Dim definition As String = NormalizeLines(entry.Definition).TrimEnd()
                 Dim content As String = header & definition & vbCrLf & "GO" & vbCrLf
                 Dim hash As String = WriteVerified(filePath, content, utf16Le)
-                verificationLines.Add(kind & " " & objectLabel & " | " & Path.Combine(FolderName(kind), fileName) & " | SHA256 " & hash)
-                savedObjects.Add(kind & " " & objectLabel)
+                verificationLines.Add("[" & row.DatabaseName & "] " & kind & " " & objectLabel & " | " & Path.Combine(relativeFolder, fileName) & " | SHA256 " & hash)
+                savedObjects.Add("[" & row.DatabaseName & "] " & kind & " " & objectLabel)
                 savedCount += 1
             Next
 
@@ -442,8 +488,9 @@ Friend NotInheritable Class BackupService
                               String.Join(vbCrLf, analysis.FilesWithoutObject) & vbCrLf, utf16Le)
             End If
 
-            Dim typeCounts As String = String.Join(vbCrLf, selected.GroupBy(Function(x) x.Declaration.Kind).OrderBy(Function(x) x.Key).Select(Function(x) x.Key & ": " & x.Count().ToString()))
-            Dim verificationReport As String = "Base: " & request.Database & vbCrLf &
+            Dim typeCounts As String = String.Join(vbCrLf, selected.GroupBy(Function(x) x.DatabaseName, StringComparer.OrdinalIgnoreCase).OrderBy(Function(x) x.Key, StringComparer.OrdinalIgnoreCase).Select(
+                Function(byDatabase) "[" & byDatabase.Key & "] " & String.Join(", ", byDatabase.GroupBy(Function(x) x.Declaration.Kind).OrderBy(Function(x) x.Key).Select(Function(x) x.Key & ": " & x.Count().ToString()))))
+            Dim verificationReport As String = If(databaseNames.Count = 1, "Base: ", "Bases: ") & String.Join(", ", databaseNames) & vbCrLf &
                                                "Objetos seleccionados: " & selected.Count.ToString() & vbCrLf &
                                                "Archivos SQL verificados: " & verificationLines.Count.ToString() & vbCrLf &
                                                typeCounts & vbCrLf & vbCrLf &
@@ -528,20 +575,20 @@ Friend NotInheritable Class BackupService
         Return value.Replace(vbCrLf, vbLf).Replace(vbCr, vbLf).Replace(vbLf, vbCrLf)
     End Function
 
-    Private Shared Function ReadCatalog(request As BackupRequest, objectNames As IEnumerable(Of String), cancellation As CancellationToken, progress As IProgress(Of String)) As List(Of CatalogObject)
+    Private Shared Function ReadCatalog(request As BackupRequest, databaseName As String, objectNames As IEnumerable(Of String), cancellation As CancellationToken, progress As IProgress(Of String)) As List(Of CatalogObject)
         Dim result As New List(Of CatalogObject)()
         Dim names As List(Of String) = objectNames.Where(Function(x) Not String.IsNullOrEmpty(x)).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
         If names.Count = 0 Then Return result
         cancellation.ThrowIfCancellationRequested()
         Try
-            Using connection As SqlConnection = CreateConnection(request, request.Database)
+            Using connection As SqlConnection = CreateConnection(request, databaseName)
                 connection.Open()
                 cancellation.ThrowIfCancellationRequested()
                 Const batchSize As Integer = 500
                 For offset As Integer = 0 To names.Count - 1 Step batchSize
                     cancellation.ThrowIfCancellationRequested()
                     Dim batch As List(Of String) = names.Skip(offset).Take(batchSize).ToList()
-                    If progress IsNot Nothing Then progress.Report("Consultando objetos " & (offset + 1).ToString() & "-" & (offset + batch.Count).ToString() & "/" & names.Count.ToString() & " en SQL Server...")
+                    If progress IsNot Nothing Then progress.Report("Consultando objetos " & (offset + 1).ToString() & "-" & (offset + batch.Count).ToString() & "/" & names.Count.ToString() & " en [" & databaseName & "]...")
                     Using command As SqlCommand = connection.CreateCommand()
                         command.CommandTimeout = 30
                         Dim placeholders As New List(Of String)()

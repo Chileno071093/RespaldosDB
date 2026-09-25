@@ -14,7 +14,7 @@ Friend NotInheritable Class MainForm
     Inherits Form
 
     Private ReadOnly serverBox As New TextBox()
-    Private ReadOnly databaseBox As New ComboBox()
+    Private ReadOnly databaseBox As New TextBox()
     Private ReadOnly loadDatabasesButton As New Button()
     Private ReadOnly userBox As New TextBox()
     Private ReadOnly passwordBox As New TextBox()
@@ -38,7 +38,6 @@ Friend NotInheritable Class MainForm
     Private analysis As BackupAnalysis
     Private busy As Boolean
     Private suppressRefresh As Boolean
-    Private updatingDatabaseList As Boolean
     Private operationCancellation As CancellationTokenSource
 
     Public Sub New()
@@ -73,17 +72,13 @@ Friend NotInheritable Class MainForm
             inputs.RowStyles.Add(New RowStyle(SizeType.Absolute, 44.0F))
         Next
         AddInput(inputs, 0, "Servidor SQL", serverBox, Nothing)
-        ' La base va despues de usuario y password: con esos datos se carga la lista de bases.
-        databaseBox.DropDownStyle = ComboBoxStyle.DropDown
-        databaseBox.AutoCompleteMode = AutoCompleteMode.SuggestAppend
-        databaseBox.AutoCompleteSource = AutoCompleteSource.ListItems
-        databaseBox.MaxDropDownItems = 20
-        loadDatabasesButton.Text = "Cargar bases"
+        ' Las bases van despues de usuario y password: con esos datos se carga la lista de bases.
+        loadDatabasesButton.Text = "Elegir bases..."
         loadDatabasesButton.Dock = DockStyle.Fill
         AddHandler loadDatabasesButton.Click, AddressOf LoadDatabasesClicked
         AddInput(inputs, 1, "Usuario SQL", userBox, Nothing)
         AddInput(inputs, 2, "Password SQL", passwordBox, Nothing)
-        AddInput(inputs, 3, "Base de datos", databaseBox, loadDatabasesButton)
+        AddInput(inputs, 3, "Bases de datos", databaseBox, loadDatabasesButton)
 
         Dim sourceButton As New Button With {.Text = "Examinar...", .Dock = DockStyle.Fill}
         AddHandler sourceButton.Click, Sub(sender, e) BrowseFolder(sourceBox)
@@ -151,7 +146,7 @@ Friend NotInheritable Class MainForm
         Me.Controls.Add(root)
         ApplySettings(UserSettings.Load(UserSettings.DefaultPath))
 
-        For Each box As Control In New Control() {serverBox, databaseBox, userBox, passwordBox, sourceBox, destinationBox}
+        For Each box As TextBox In {serverBox, databaseBox, userBox, passwordBox, sourceBox, destinationBox}
             AddHandler box.TextChanged, AddressOf InputsChanged
         Next
         AddHandler includeSubfoldersBox.CheckedChanged, AddressOf InputsChanged
@@ -204,6 +199,7 @@ Friend NotInheritable Class MainForm
         objectsGrid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.AllCells
         objectsGrid.RowHeadersVisible = False
         objectsGrid.Columns.Add(New DataGridViewCheckBoxColumn With {.HeaderText = "Guardar", .Width = 65})
+        objectsGrid.Columns.Add(New DataGridViewTextBoxColumn With {.HeaderText = "Base", .Width = 180, .ReadOnly = True})
         objectsGrid.Columns.Add(New DataGridViewTextBoxColumn With {.HeaderText = "Tipo", .Width = 110, .ReadOnly = True})
         objectsGrid.Columns.Add(New DataGridViewTextBoxColumn With {.HeaderText = "Objeto declarado", .Width = 250, .ReadOnly = True})
         objectsGrid.Columns.Add(New DataGridViewTextBoxColumn With {.HeaderText = "Archivo", .Width = 220, .ReadOnly = True})
@@ -234,7 +230,6 @@ Friend NotInheritable Class MainForm
     End Sub
 
     Private Sub InputsChanged(sender As Object, e As EventArgs)
-        If updatingDatabaseList Then Return
         analysis = Nothing
         objectsGrid.Rows.Clear()
         summaryLabel.Text = "Los datos cambiaron. Pulsa Analizar de nuevo."
@@ -296,7 +291,7 @@ Friend NotInheritable Class MainForm
                 Dim fileLabel As String = Path.GetFileName(item.Declaration.SourceFile)
                 If item.AlsoDeclaredIn IsNot Nothing AndAlso item.AlsoDeclaredIn.Count > 0 Then fileLabel &= " (+" & item.AlsoDeclaredIn.Count.ToString() & ")"
                 Dim gridRow As New DataGridViewRow()
-                gridRow.CreateCells(objectsGrid, item.CanBackup, item.Declaration.Kind, item.Declaration.DisplayName(), fileLabel, item.Status, item.Detail)
+                gridRow.CreateCells(objectsGrid, item.CanBackup, item.DatabaseName, item.Declaration.Kind, item.Declaration.DisplayName(), fileLabel, item.Status, item.Detail)
                 gridRow.Tag = item
                 newRows.Add(gridRow)
             Next
@@ -312,6 +307,23 @@ Friend NotInheritable Class MainForm
         RefreshActionButtons()
     End Sub
 
+    ' Bases escritas en el campo, separadas por coma o punto y coma, sin repetir.
+    Private Function SelectedDatabases() As List(Of String)
+        Return ParseDatabaseList(databaseBox.Text)
+    End Function
+
+    Friend Shared Function ParseDatabaseList(text As String) As List(Of String)
+        Return text.Split({","c, ";"c}).Select(Function(x) x.Trim()).Where(Function(x) x.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
+    End Function
+
+    Private Sub SetSelectedDatabases(names As IEnumerable(Of String))
+        Dim list As List(Of String) = names.ToList()
+        Dim current As List(Of String) = SelectedDatabases()
+        ' Si el conjunto no cambia (aunque cambie el orden o las mayusculas) no se invalida la vista previa.
+        If list.Count = current.Count AndAlso list.All(Function(x) current.Contains(x, StringComparer.OrdinalIgnoreCase)) Then Return
+        databaseBox.Text = String.Join(", ", list)
+    End Sub
+
     ' connectionOnly: solo se necesitan servidor, usuario y password (por ejemplo, para listar las bases).
     Private Function CreateRequest(connectionOnly As Boolean) As BackupRequest
         If connectionOnly Then
@@ -321,12 +333,12 @@ Friend NotInheritable Class MainForm
                 Throw New InvalidOperationException("Completa servidor, usuario y password.")
             End If
         ElseIf String.IsNullOrWhiteSpace(serverBox.Text) OrElse
-           String.IsNullOrWhiteSpace(databaseBox.Text) OrElse
+           SelectedDatabases().Count = 0 OrElse
            String.IsNullOrWhiteSpace(userBox.Text) OrElse
            String.IsNullOrEmpty(passwordBox.Text) OrElse
            String.IsNullOrWhiteSpace(sourceBox.Text) OrElse
            String.IsNullOrWhiteSpace(destinationBox.Text) Then
-            Throw New InvalidOperationException("Completa servidor, base, usuario, password, origen y destino.")
+            Throw New InvalidOperationException("Completa servidor, bases, usuario, password, origen y destino.")
         End If
         Dim password As New SecureString()
         For Each character As Char In passwordBox.Text
@@ -335,7 +347,7 @@ Friend NotInheritable Class MainForm
         password.MakeReadOnly()
         Return New BackupRequest With {
             .Server = serverBox.Text.Trim(),
-            .Database = databaseBox.Text.Trim(),
+            .Databases = SelectedDatabases(),
             .UserName = userBox.Text.Trim(),
             .Password = password,
             .Encrypt = encryptBox.Checked,
@@ -396,33 +408,18 @@ Friend NotInheritable Class MainForm
             connectionOnly:=True)
         If names Is Nothing Then Return
 
-        ' Rellenar la lista no debe invalidar la vista previa si la base elegida no cambia.
-        Dim current As String = databaseBox.Text.Trim()
-        Dim match As String = names.FirstOrDefault(Function(x) String.Equals(x, current, StringComparison.OrdinalIgnoreCase))
-        updatingDatabaseList = True
-        Try
-            databaseBox.BeginUpdate()
-            databaseBox.Items.Clear()
-            databaseBox.Items.AddRange(names.Cast(Of Object)().ToArray())
-            databaseBox.EndUpdate()
-            If match IsNot Nothing Then
-                databaseBox.SelectedItem = match
-            Else
-                databaseBox.Text = current
-            End If
-        Finally
-            updatingDatabaseList = False
-        End Try
-
         If names.Count = 0 Then
             outputBox.Text = "Conexion correcta, pero el usuario no tiene acceso a ninguna base de datos de usuario."
-        ElseIf match IsNot Nothing Then
-            outputBox.Text = "Conexion correcta: " & names.Count.ToString() & " base(s) disponible(s). Se mantiene " & match & "."
-        Else
-            outputBox.Text = "Conexion correcta: " & names.Count.ToString() & " base(s) disponible(s). Elige una en la lista 'Base de datos'."
-            databaseBox.Focus()
-            databaseBox.DroppedDown = True
+            Return
         End If
+        Using dialog As New DatabasePickerForm(names, SelectedDatabases())
+            If dialog.ShowDialog(Me) = DialogResult.OK Then
+                SetSelectedDatabases(dialog.SelectedDatabases)
+                outputBox.Text = "Bases elegidas: " & dialog.SelectedDatabases.Count.ToString() & " de " & names.Count.ToString() & " disponibles."
+            Else
+                outputBox.Text = "Conexion correcta: " & names.Count.ToString() & " base(s) disponible(s). No se cambio la seleccion."
+            End If
+        End Using
     End Sub
 
     Private Async Sub AnalyzeClicked(sender As Object, e As EventArgs)
@@ -441,8 +438,9 @@ Friend NotInheritable Class MainForm
         PopulateGrid(result.Items)
         SaveSettings()
         Dim ready As Integer = result.Items.Where(Function(x) x.CanBackup).Count()
-        summaryLabel.Text = result.Items.Count.ToString() & " objetos detectados; " & ready.ToString() & " listos; " &
-                            (result.Items.Count - ready).ToString() & " requieren revision."
+        Dim databaseCount As Integer = result.Items.Select(Function(x) x.DatabaseName).Distinct(StringComparer.OrdinalIgnoreCase).Count()
+        summaryLabel.Text = result.Items.Count.ToString() & " filas (objeto por base) en " & databaseCount.ToString() & " base(s); " &
+                            ready.ToString() & " listas; " & (result.Items.Count - ready).ToString() & " requieren revision."
         outputBox.Text = "Marca objetos para el respaldo. Selecciona filas (Ctrl/Shift) para Comparar o Buscar en bases."
         If result.FilesWithoutObject.Count > 0 Then
             outputBox.AppendText(vbCrLf & result.FilesWithoutObject.Count.ToString() & " archivo(s) .sql sin declaraciones reconocidas.")
@@ -462,7 +460,7 @@ Friend NotInheritable Class MainForm
         Dim selectedObjects As New List(Of DeclaredObject)()
         For Each row As DataGridViewRow In objectsGrid.SelectedRows
             Dim item As AnalysisItem = TryCast(row.Tag, AnalysisItem)
-            If item IsNot Nothing Then selectedObjects.Add(item.Declaration)
+            If item IsNot Nothing AndAlso Not selectedObjects.Contains(item.Declaration) Then selectedObjects.Add(item.Declaration)
         Next
         If selectedObjects.Count = 0 Then Return
 
@@ -476,8 +474,8 @@ Friend NotInheritable Class MainForm
         outputBox.Text = "Buscadas " & report.ScannedDatabases.ToString() & " bases accesibles; " &
                          report.Locations.Count.ToString() & " coincidencias visibles."
         Using dialog As New DatabaseSearchForm(report)
-            If dialog.ShowDialog(Me) = DialogResult.OK AndAlso Not String.IsNullOrEmpty(dialog.SelectedDatabase) Then
-                databaseBox.Text = dialog.SelectedDatabase
+            If dialog.ShowDialog(Me) = DialogResult.OK AndAlso dialog.SelectedDatabases.Count > 0 Then
+                SetSelectedDatabases(SelectedDatabases().Concat(dialog.SelectedDatabases).Distinct(StringComparer.OrdinalIgnoreCase))
             End If
         End Using
     End Sub
@@ -537,7 +535,7 @@ Friend NotInheritable Class CompareForm
 
     Public Sub New(item As AnalysisItem)
         Me.item = item
-        Me.Text = "Comparar " & item.Declaration.DisplayName()
+        Me.Text = "Comparar [" & item.DatabaseName & "] " & item.Declaration.DisplayName()
         Me.StartPosition = FormStartPosition.CenterParent
         Me.Size = New Size(1100, 750)
         Me.MinimumSize = New Size(800, 500)
@@ -695,7 +693,7 @@ Friend NotInheritable Class DatabaseSearchForm
 
     Private ReadOnly locationsGrid As New DataGridView()
     Private ReadOnly chooseButton As New Button()
-    Public Property SelectedDatabase As String
+    Public ReadOnly Property SelectedDatabases As New List(Of String)()
 
     Public Sub New(report As DatabaseSearchReport)
         Me.Text = "Bases donde aparecen los objetos"
@@ -723,7 +721,7 @@ Friend NotInheritable Class DatabaseSearchForm
         locationsGrid.ReadOnly = True
         locationsGrid.AllowUserToAddRows = False
         locationsGrid.AllowUserToDeleteRows = False
-        locationsGrid.MultiSelect = False
+        locationsGrid.MultiSelect = True
         locationsGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect
         locationsGrid.RowHeadersVisible = False
         locationsGrid.Columns.Add("BaseDatos", "Base de datos")
@@ -753,8 +751,8 @@ Friend NotInheritable Class DatabaseSearchForm
         root.Controls.Add(skippedBox, 0, 2)
 
         Dim actions As New FlowLayoutPanel With {.Dock = DockStyle.Fill}
-        chooseButton.Text = "Usar base seleccionada"
-        chooseButton.Width = 190
+        chooseButton.Text = "Agregar bases seleccionadas"
+        chooseButton.Width = 210
         chooseButton.Enabled = report.Locations.Count > 0
         AddHandler chooseButton.Click, AddressOf ChooseDatabase
         Dim closeButton As New Button With {.Text = "Cerrar", .Width = 90, .DialogResult = DialogResult.Cancel}
@@ -766,8 +764,14 @@ Friend NotInheritable Class DatabaseSearchForm
     End Sub
 
     Private Sub ChooseDatabase(sender As Object, e As EventArgs)
-        If locationsGrid.CurrentRow Is Nothing Then Return
-        SelectedDatabase = Convert.ToString(locationsGrid.CurrentRow.Cells(0).Value)
+        ' Filas seleccionadas (Ctrl/Shift); si no hay ninguna, la fila actual.
+        Dim rows As IEnumerable(Of DataGridViewRow) = locationsGrid.SelectedRows.Cast(Of DataGridViewRow)()
+        If Not rows.Any() AndAlso locationsGrid.CurrentRow IsNot Nothing Then rows = {locationsGrid.CurrentRow}
+        For Each row As DataGridViewRow In rows.OrderBy(Function(x) x.Index)
+            Dim name As String = Convert.ToString(row.Cells(0).Value)
+            If Not SelectedDatabases.Contains(name, StringComparer.OrdinalIgnoreCase) Then SelectedDatabases.Add(name)
+        Next
+        If SelectedDatabases.Count = 0 Then Return
         Me.DialogResult = DialogResult.OK
         Me.Close()
     End Sub
