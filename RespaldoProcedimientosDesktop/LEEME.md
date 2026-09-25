@@ -2,7 +2,11 @@
 
 Proyecto VB.NET Windows Forms para Visual Studio 2022 y .NET Framework 4.8.
 
+Usa el paquete NuGet `Microsoft.Data.SqlClient`; Visual Studio lo restaura al compilar (desde la línea de comandos: `msbuild /restore`).
+
 Abra `RespaldoProcedimientosDesktop.sln` en Visual Studio. Complete servidor, base de datos, usuario y password de SQL Server. Elija la carpeta con los archivos `.sql` y la carpeta donde desea guardar el respaldo. Pulse **Analizar** para ver los objetos antes de crear archivos. Marque los que desea guardar y pulse **Respaldar seleccionados**. El botón **Comparar** muestra la definición actual junto con la declaración del archivo y una comparación por líneas. **Cancelar** detiene la operación activa de análisis, búsqueda o respaldo; si ya terminó, el botón queda deshabilitado. Durante el respaldo se escriben primero archivos temporales, que se limpian si se cancela antes de crear la carpeta final.
+
+El usuario y el password se envían con `SqlCredential` (el password como `SecureString`), no dentro de la cadena de conexión, y se liberan al terminar cada operación. **Cifrar conexion** (activada por defecto) exige cifrado TLS. **Confiar en el certificado del servidor** (activada por defecto) acepta certificados autofirmados, habituales en servidores internos: la conexión va cifrada, pero no se valida la identidad del servidor. Si el servidor tiene un certificado válido, desmarque esa opción para validarlo.
 
 Para ubicar objetos en otras bases del mismo servidor, seleccione una o varias filas de la vista previa con Ctrl/Shift y pulse **Buscar en bases**. La búsqueda revisa las bases de usuario en línea y accesibles para el login SQL. Muestra base, tipo, esquema y nombre; desde el resultado puede usar una base como nueva base de análisis. Esta consulta no cambia ni respalda las otras bases. Los catálogos solo muestran los objetos para los que el usuario tiene visibilidad, por lo que la ausencia de una coincidencia no demuestra que el objeto no exista.
 
@@ -16,4 +20,4 @@ Antes de escribir, la aplicación vuelve a consultar SQL Server y detiene el res
 
 Cuando un objeto no aparece en el catálogo con el usuario usado, la aplicación muestra **No visible o inexistente**: esas situaciones no se pueden distinguir de forma fiable con esas mismas credenciales. Si el catálogo muestra el objeto pero no entrega su definición, se informa por separado como **Sin definicion**.
 
-El proyecto compila con Visual Studio 2022. El análisis, el respaldo y la búsqueda en bases se probaron contra LocalDB con autenticación de Windows mediante un arnés de pruebas; falta probarlos con login SQL en el servidor real.
+El proyecto compila con Visual Studio 2022. El análisis, el respaldo y la búsqueda en bases se probaron contra LocalDB mediante un arnés de pruebas, incluido un login SQL con `SqlCredential`; falta probarlos en el servidor real.

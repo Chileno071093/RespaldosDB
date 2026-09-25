@@ -1,20 +1,24 @@
 Imports System
 Imports System.Collections.Generic
 Imports System.Data
-Imports System.Data.SqlClient
 Imports System.Diagnostics
 Imports System.IO
 Imports System.Linq
+Imports System.Security
 Imports System.Security.Cryptography
 Imports System.Text
 Imports System.Threading
+Imports Microsoft.Data.SqlClient
 Imports Microsoft.VisualBasic
 
 Friend NotInheritable Class BackupRequest
     Public Property Server As String
     Public Property Database As String
     Public Property UserName As String
-    Public Property Password As String
+    ''' <summary>Debe ser de solo lectura (MakeReadOnly); quien crea la solicitud la libera al terminar.</summary>
+    Public Property Password As SecureString
+    Public Property Encrypt As Boolean
+    Public Property TrustServerCertificate As Boolean
     Public Property SourceFolder As String
     Public Property DestinationFolder As String
     Public Property IncludeSubfolders As Boolean
@@ -304,7 +308,7 @@ Friend NotInheritable Class BackupService
     End Function
 
     Private Shared Function OpenConnection(request As BackupRequest, databaseName As String, cancellation As CancellationToken) As SqlConnection
-        Dim connection As New SqlConnection(ConnectionStringFor(request, databaseName))
+        Dim connection As SqlConnection = CreateConnection(request, databaseName)
         Try
             connection.Open()
             cancellation.ThrowIfCancellationRequested()
@@ -511,7 +515,7 @@ Friend NotInheritable Class BackupService
         If names.Count = 0 Then Return result
         cancellation.ThrowIfCancellationRequested()
         Try
-            Using connection As New SqlConnection(ConnectionStringFor(request, request.Database))
+            Using connection As SqlConnection = CreateConnection(request, request.Database)
                 connection.Open()
                 cancellation.ThrowIfCancellationRequested()
                 Const batchSize As Integer = 500
@@ -565,18 +569,19 @@ Friend NotInheritable Class BackupService
         Return result
     End Function
 
-    Private Shared Function ConnectionStringFor(request As BackupRequest, databaseName As String) As String
+    ' El usuario y el password viajan en SqlCredential, no en la cadena de conexion.
+    Private Shared Function CreateConnection(request As BackupRequest, databaseName As String) As SqlConnection
         Dim builder As New SqlConnectionStringBuilder With {
             .DataSource = request.Server,
             .InitialCatalog = databaseName,
             .IntegratedSecurity = False,
-            .UserID = request.UserName,
-            .Password = request.Password,
             .PersistSecurityInfo = False,
             .ConnectTimeout = 5,
+            .Encrypt = If(request.Encrypt, SqlConnectionEncryptOption.Mandatory, SqlConnectionEncryptOption.Optional),
+            .TrustServerCertificate = request.TrustServerCertificate,
             .ApplicationName = "Respaldo objetos SQL TE"
         }
-        Return builder.ConnectionString
+        Return New SqlConnection(builder.ConnectionString, New SqlCredential(request.UserName, request.Password))
     End Function
 
     Private Shared Function Matches(item As DeclaredObject, entry As CatalogObject) As Boolean

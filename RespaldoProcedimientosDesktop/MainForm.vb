@@ -3,6 +3,7 @@ Imports System.Collections.Generic
 Imports System.Drawing
 Imports System.IO
 Imports System.Linq
+Imports System.Security
 Imports System.Text
 Imports System.Threading
 Imports System.Threading.Tasks
@@ -19,6 +20,9 @@ Friend NotInheritable Class MainForm
     Private ReadOnly sourceBox As New TextBox()
     Private ReadOnly destinationBox As New TextBox()
     Private ReadOnly includeSubfoldersBox As New CheckBox()
+    Private ReadOnly encryptBox As New CheckBox()
+    Private ReadOnly trustCertificateBox As New CheckBox()
+    Private ReadOnly optionsPanel As New FlowLayoutPanel()
     Private ReadOnly analyzeButton As New Button()
     Private ReadOnly backupButton As New Button()
     Private ReadOnly compareButton As New Button()
@@ -83,8 +87,19 @@ Friend NotInheritable Class MainForm
         root.Controls.Add(inputs, 0, 0)
 
         includeSubfoldersBox.Text = "Incluir subcarpetas de la carpeta de scripts"
-        includeSubfoldersBox.Dock = DockStyle.Fill
-        root.Controls.Add(includeSubfoldersBox, 0, 1)
+        encryptBox.Text = "Cifrar conexion"
+        encryptBox.Checked = True
+        trustCertificateBox.Text = "Confiar en el certificado del servidor (sin validarlo)"
+        trustCertificateBox.Checked = True
+        AddHandler encryptBox.CheckedChanged, Sub(sender, e) trustCertificateBox.Enabled = encryptBox.Checked
+        optionsPanel.Dock = DockStyle.Fill
+        optionsPanel.WrapContents = False
+        For Each box As CheckBox In {includeSubfoldersBox, encryptBox, trustCertificateBox}
+            box.AutoSize = True
+            box.Margin = New Padding(3, 6, 24, 3)
+            optionsPanel.Controls.Add(box)
+        Next
+        root.Controls.Add(optionsPanel, 0, 1)
 
         Dim actions As New FlowLayoutPanel With {.Dock = DockStyle.Fill, .WrapContents = False}
         analyzeButton.Text = "Analizar"
@@ -260,11 +275,18 @@ Friend NotInheritable Class MainForm
            String.IsNullOrWhiteSpace(destinationBox.Text) Then
             Throw New InvalidOperationException("Completa servidor, base, usuario, password, origen y destino.")
         End If
+        Dim password As New SecureString()
+        For Each character As Char In passwordBox.Text
+            password.AppendChar(character)
+        Next
+        password.MakeReadOnly()
         Return New BackupRequest With {
             .Server = serverBox.Text.Trim(),
             .Database = databaseBox.Text.Trim(),
             .UserName = userBox.Text.Trim(),
-            .Password = passwordBox.Text,
+            .Password = password,
+            .Encrypt = encryptBox.Checked,
+            .TrustServerCertificate = encryptBox.Checked AndAlso trustCertificateBox.Checked,
             .SourceFolder = sourceBox.Text.Trim(),
             .DestinationFolder = destinationBox.Text.Trim(),
             .IncludeSubfolders = includeSubfoldersBox.Checked
@@ -280,7 +302,7 @@ Friend NotInheritable Class MainForm
             operationCancellation = cancellation
             busy = True
             inputs.Enabled = False
-            includeSubfoldersBox.Enabled = False
+            optionsPanel.Enabled = False
             RefreshActionButtons()
             outputBox.Text = "Leyendo scripts y consultando la base de datos..."
             Dim progress As IProgress(Of String) = New Progress(Of String)(Sub(message) ShowOperationProgress(cancellation, message))
@@ -305,10 +327,10 @@ Friend NotInheritable Class MainForm
         Finally
             operationCancellation = Nothing
             If cancellation IsNot Nothing Then cancellation.Dispose()
-            If request IsNot Nothing Then request.Password = Nothing
+            If request IsNot Nothing AndAlso request.Password IsNot Nothing Then request.Password.Dispose()
             busy = False
             inputs.Enabled = True
-            includeSubfoldersBox.Enabled = True
+            optionsPanel.Enabled = True
             RefreshActionButtons()
         End Try
     End Sub
@@ -338,7 +360,7 @@ Friend NotInheritable Class MainForm
             operationCancellation = cancellation
             busy = True
             inputs.Enabled = False
-            includeSubfoldersBox.Enabled = False
+            optionsPanel.Enabled = False
             RefreshActionButtons()
             outputBox.Text = "Buscando los nombres seleccionados en las bases visibles del servidor..."
             Dim progress As IProgress(Of String) = New Progress(Of String)(Sub(message) ShowOperationProgress(cancellation, message))
@@ -360,10 +382,10 @@ Friend NotInheritable Class MainForm
         Finally
             operationCancellation = Nothing
             If cancellation IsNot Nothing Then cancellation.Dispose()
-            If request IsNot Nothing Then request.Password = Nothing
+            If request IsNot Nothing AndAlso request.Password IsNot Nothing Then request.Password.Dispose()
             busy = False
             inputs.Enabled = True
-            includeSubfoldersBox.Enabled = True
+            optionsPanel.Enabled = True
             RefreshActionButtons()
         End Try
     End Sub
@@ -397,7 +419,7 @@ Friend NotInheritable Class MainForm
             operationCancellation = cancellation
             busy = True
             inputs.Enabled = False
-            includeSubfoldersBox.Enabled = False
+            optionsPanel.Enabled = False
             RefreshActionButtons()
             outputBox.Text = "Comprobando que SQL Server no cambio desde la vista previa y guardando archivos..."
             Dim progress As IProgress(Of String) = New Progress(Of String)(Sub(message) ShowOperationProgress(cancellation, message))
@@ -417,10 +439,10 @@ Friend NotInheritable Class MainForm
         Finally
             operationCancellation = Nothing
             If cancellation IsNot Nothing Then cancellation.Dispose()
-            If request IsNot Nothing Then request.Password = Nothing
+            If request IsNot Nothing AndAlso request.Password IsNot Nothing Then request.Password.Dispose()
             busy = False
             inputs.Enabled = True
-            includeSubfoldersBox.Enabled = True
+            optionsPanel.Enabled = True
             RefreshActionButtons()
         End Try
     End Sub
