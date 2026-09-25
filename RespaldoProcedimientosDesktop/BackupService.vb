@@ -143,35 +143,37 @@ Friend NotInheritable Class BackupService
         Dim ordered As List(Of KeyValuePair(Of String, DeclaredObject)) = declared.OrderBy(Function(x) x.Value.DisplayName()).ToList()
         Dim rows As New List(Of AnalysisItem)()
         Dim failures As New List(Of SqlException)()
-        For databaseIndex As Integer = 0 To databases.Count - 1
-            cancellation.ThrowIfCancellationRequested()
-            Dim databaseName As String = databases(databaseIndex)
-            ' Una declaracion con base explicita ([Base].[esquema].[objeto]) solo se revisa en esa base.
-            Dim targets As List(Of KeyValuePair(Of String, DeclaredObject)) = ordered.Where(Function(x) String.IsNullOrEmpty(x.Value.DatabaseName) OrElse String.Equals(x.Value.DatabaseName, databaseName, StringComparison.OrdinalIgnoreCase)).ToList()
-            If targets.Count = 0 Then Continue For
-            If progress IsNot Nothing Then progress.Report("Consultando base " & (databaseIndex + 1).ToString() & "/" & databases.Count.ToString() & ": " & databaseName & "...")
-            Dim names As List(Of String) = targets.Select(Function(x) x.Value.ObjectName).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
-            Dim catalog As List(Of CatalogObject) = Nothing
-            Dim failure As SqlException = Nothing
-            Try
-                catalog = ReadCatalog(request, databaseName, names, cancellation, progress)
-            Catch ex As SqlException
+        Using session As New DatabaseSession(request, cancellation)
+            For databaseIndex As Integer = 0 To databases.Count - 1
                 cancellation.ThrowIfCancellationRequested()
-                failures.Add(ex)
-                failure = ex
-            End Try
-            For Each pair As KeyValuePair(Of String, DeclaredObject) In targets
-                cancellation.ThrowIfCancellationRequested()
-                Dim row As AnalysisItem = NewRow(databaseName, pair, duplicates)
-                If failure IsNot Nothing Then
-                    row.Status = "Base no disponible"
-                    row.Detail = failure.Message
-                Else
-                    ClassifyRow(row, catalog)
-                End If
-                rows.Add(AppendDuplicateDetail(row))
+                Dim databaseName As String = databases(databaseIndex)
+                ' Una declaracion con base explicita ([Base].[esquema].[objeto]) solo se revisa en esa base.
+                Dim targets As List(Of KeyValuePair(Of String, DeclaredObject)) = ordered.Where(Function(x) String.IsNullOrEmpty(x.Value.DatabaseName) OrElse String.Equals(x.Value.DatabaseName, databaseName, StringComparison.OrdinalIgnoreCase)).ToList()
+                If targets.Count = 0 Then Continue For
+                If progress IsNot Nothing Then progress.Report("Consultando base " & (databaseIndex + 1).ToString() & "/" & databases.Count.ToString() & ": " & databaseName & "...")
+                Dim names As List(Of String) = targets.Select(Function(x) x.Value.ObjectName).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
+                Dim catalogByName As ILookup(Of String, CatalogObject) = Nothing
+                Dim failure As SqlException = Nothing
+                Try
+                    catalogByName = ReadCatalog(session.UseDatabase(databaseName), databaseName, names, cancellation, progress).ToLookup(Function(x) x.ObjectName, StringComparer.OrdinalIgnoreCase)
+                Catch ex As SqlException
+                    cancellation.ThrowIfCancellationRequested()
+                    failures.Add(ex)
+                    failure = ex
+                End Try
+                For Each pair As KeyValuePair(Of String, DeclaredObject) In targets
+                    cancellation.ThrowIfCancellationRequested()
+                    Dim row As AnalysisItem = NewRow(databaseName, pair, duplicates)
+                    If failure IsNot Nothing Then
+                        row.Status = "Base no disponible"
+                        row.Detail = failure.Message
+                    Else
+                        ClassifyRow(row, catalogByName)
+                    End If
+                    rows.Add(AppendDuplicateDetail(row))
+                Next
             Next
-        Next
+        End Using
         ' Si ninguna base respondio (p. ej. password incorrecto), se informa el error como antes.
         If failures.Count > 0 AndAlso failures.Count = databases.Count Then Throw failures(0)
 
@@ -199,8 +201,9 @@ Friend NotInheritable Class BackupService
         Return New AnalysisItem With {.Key = databaseName & "|" & pair.Key, .DatabaseName = databaseName, .Declaration = pair.Value, .AlsoDeclaredIn = others}
     End Function
 
-    Private Shared Sub ClassifyRow(row As AnalysisItem, catalog As List(Of CatalogObject))
-        Dim candidates As List(Of CatalogObject) = catalog.Where(Function(x) Matches(row.Declaration, x)).ToList()
+    ' El catalogo viene indexado por nombre: con miles de objetos no se recorre todo por cada declaracion.
+    Private Shared Sub ClassifyRow(row As AnalysisItem, catalogByName As ILookup(Of String, CatalogObject))
+        Dim candidates As List(Of CatalogObject) = catalogByName(row.Declaration.ObjectName).Where(Function(x) Matches(row.Declaration, x)).ToList()
         If candidates.Count = 0 Then
             row.Status = "No visible o inexistente"
             row.Detail = "Con este usuario no es posible distinguir falta de permisos de ausencia del objeto."
@@ -258,12 +261,13 @@ Friend NotInheritable Class BackupService
         Next
         Dim nameFilter As String = String.Join(",", placeholders)
 
-        ' Una sola conexion para todo el recorrido: cambiar de base con ChangeDatabase evita repetir el login por cada base.
-        Dim connection As SqlConnection = Nothing
-        Try
+        ' Busqueda por nombre de las declaraciones seleccionadas, para no recorrerlas todas por cada objeto del catalogo.
+        Dim targetsByName As ILookup(Of String, DeclaredObject) = targets.ToLookup(Function(x) x.ObjectName, StringComparer.OrdinalIgnoreCase)
+
+        ' Una sola conexion para todo el recorrido (ver DatabaseSession).
+        Using session As New DatabaseSession(request, cancellation)
             Try
-                connection = OpenConnection(request, "master", cancellation)
-                databases.AddRange(ReadDatabaseNames(connection, cancellation))
+                databases.AddRange(ReadDatabaseNames(session.UseDatabase("master"), cancellation))
             Catch ex As SqlException
                 cancellation.ThrowIfCancellationRequested()
                 Throw
@@ -275,13 +279,7 @@ Friend NotInheritable Class BackupService
                 If progress IsNot Nothing Then progress.Report("Revisando base " & (databaseIndex + 1).ToString() & "/" & databases.Count.ToString() & ": " & databaseName)
                 Dim watch As Stopwatch = Stopwatch.StartNew()
                 Try
-                    If connection Is Nothing OrElse connection.State <> ConnectionState.Open Then
-                        If connection IsNot Nothing Then connection.Dispose()
-                        connection = Nothing
-                        connection = OpenConnection(request, databaseName, cancellation)
-                    Else
-                        connection.ChangeDatabase(databaseName)
-                    End If
+                    Dim connection As SqlConnection = session.UseDatabase(databaseName)
                     cancellation.ThrowIfCancellationRequested()
                     Using command As SqlCommand = connection.CreateCommand()
                         command.CommandTimeout = 10
@@ -303,7 +301,7 @@ Friend NotInheritable Class BackupService
                                         .ObjectName = reader.GetString(1),
                                         .TypeCode = reader.GetString(2).Trim()
                                     }
-                                    For Each target As DeclaredObject In targets
+                                    For Each target As DeclaredObject In targetsByName(entry.ObjectName)
                                         If Not Matches(target, entry) Then Continue For
                                         Dim key As String = databaseName & "|" & entry.TypeCode & "|" & entry.SchemaName & "|" & entry.ObjectName
                                         If Not locations.ContainsKey(key) Then
@@ -330,15 +328,13 @@ Friend NotInheritable Class BackupService
                     If progress IsNot Nothing AndAlso Not cancellation.IsCancellationRequested Then progress.Report("Completadas " & (databaseIndex + 1).ToString() & "/" & databases.Count.ToString() & " bases. " & databaseName & ": " & watch.Elapsed.TotalSeconds.ToString("0.0") & " s")
                 End Try
             Next
-        Finally
-            If connection IsNot Nothing Then connection.Dispose()
-        End Try
+        End Using
 
         Dim unmatched As New List(Of String)()
+        Dim locationsByName As ILookup(Of String, DatabaseLocation) = locations.Values.ToLookup(Function(x) x.ObjectName, StringComparer.OrdinalIgnoreCase)
         For Each target As DeclaredObject In targets
-            Dim found As Boolean = locations.Values.Any(Function(x) String.Equals(x.Kind, target.Kind, StringComparison.OrdinalIgnoreCase) AndAlso
-                                                                String.Equals(x.ObjectName, target.ObjectName, StringComparison.OrdinalIgnoreCase) AndAlso
-                                                                (String.IsNullOrEmpty(target.SchemaName) OrElse String.Equals(x.SchemaName, target.SchemaName, StringComparison.OrdinalIgnoreCase)))
+            Dim found As Boolean = locationsByName(target.ObjectName).Any(Function(x) String.Equals(x.Kind, target.Kind, StringComparison.OrdinalIgnoreCase) AndAlso
+                                                                              (String.IsNullOrEmpty(target.SchemaName) OrElse String.Equals(x.SchemaName, target.SchemaName, StringComparison.OrdinalIgnoreCase)))
             If Not found AndAlso Not unmatched.Contains(target.DisplayName()) Then unmatched.Add(target.DisplayName())
         Next
 
@@ -383,9 +379,51 @@ Friend NotInheritable Class BackupService
         Return databases
     End Function
 
+    Private Shared connectionOpenCount As Integer
+
+    ' Cuantas conexiones se han abierto (cada una implica un login); lo usan las pruebas.
+    Friend Shared ReadOnly Property ConnectionsOpened As Integer
+        Get
+            Return Volatile.Read(connectionOpenCount)
+        End Get
+    End Property
+
+    ' Una conexion para recorrer varias bases: cambia de base con ChangeDatabase y solo vuelve a abrir
+    ' (y a hacer login) si un error la dejo cerrada.
+    Private NotInheritable Class DatabaseSession
+        Implements IDisposable
+
+        Private ReadOnly request As BackupRequest
+        Private ReadOnly cancellation As CancellationToken
+        Private connection As SqlConnection
+
+        Public Sub New(request As BackupRequest, cancellation As CancellationToken)
+            Me.request = request
+            Me.cancellation = cancellation
+        End Sub
+
+        Public Function UseDatabase(databaseName As String) As SqlConnection
+            cancellation.ThrowIfCancellationRequested()
+            If connection Is Nothing OrElse connection.State <> ConnectionState.Open Then
+                If connection IsNot Nothing Then connection.Dispose()
+                connection = Nothing
+                connection = OpenConnection(request, databaseName, cancellation)
+            ElseIf Not String.Equals(connection.Database, databaseName, StringComparison.OrdinalIgnoreCase) Then
+                connection.ChangeDatabase(databaseName)
+            End If
+            Return connection
+        End Function
+
+        Public Sub Dispose() Implements IDisposable.Dispose
+            If connection IsNot Nothing Then connection.Dispose()
+            connection = Nothing
+        End Sub
+    End Class
+
     Private Shared Function OpenConnection(request As BackupRequest, databaseName As String, cancellation As CancellationToken) As SqlConnection
         Dim connection As SqlConnection = CreateConnection(request, databaseName)
         Try
+            Interlocked.Increment(connectionOpenCount)
             connection.Open()
             cancellation.ThrowIfCancellationRequested()
             Return connection
@@ -430,21 +468,23 @@ Friend NotInheritable Class BackupService
         Next
 
         If progress IsNot Nothing Then progress.Report("Verificando las definiciones seleccionadas en SQL Server...")
-        For Each group As IGrouping(Of String, AnalysisItem) In selected.GroupBy(Function(x) x.DatabaseName, StringComparer.OrdinalIgnoreCase)
-            Dim currentCatalog As List(Of CatalogObject) = ReadCatalog(request, group.Key, group.Select(Function(x) x.Current.ObjectName), cancellation, progress)
-            For Each row As AnalysisItem In group
-                cancellation.ThrowIfCancellationRequested()
-                Dim matchesNow As List(Of CatalogObject) = currentCatalog.Where(Function(x) ExactMatch(row.Current, x)).ToList()
-                If matchesNow.Count <> 1 OrElse matchesNow(0).Definition Is Nothing Then
-                    Throw New InvalidOperationException("El objeto " & row.Declaration.DisplayName() & " de [" & row.DatabaseName & "] ya no esta disponible. Vuelve a analizar.")
-                End If
-                Dim now As CatalogObject = matchesNow(0)
-                If Not String.Equals(row.Current.Definition, now.Definition, StringComparison.Ordinal) OrElse
-                   row.Current.AnsiNulls <> now.AnsiNulls OrElse row.Current.QuotedIdentifier <> now.QuotedIdentifier Then
-                    Throw New InvalidOperationException("La definicion de " & row.Declaration.DisplayName() & " en [" & row.DatabaseName & "] cambio desde la vista previa. Vuelve a analizar.")
-                End If
+        Using session As New DatabaseSession(request, cancellation)
+            For Each group As IGrouping(Of String, AnalysisItem) In selected.GroupBy(Function(x) x.DatabaseName, StringComparer.OrdinalIgnoreCase)
+                Dim currentByName As ILookup(Of String, CatalogObject) = ReadCatalog(session.UseDatabase(group.Key), group.Key, group.Select(Function(x) x.Current.ObjectName), cancellation, progress).ToLookup(Function(x) x.ObjectName, StringComparer.OrdinalIgnoreCase)
+                For Each row As AnalysisItem In group
+                    cancellation.ThrowIfCancellationRequested()
+                    Dim matchesNow As List(Of CatalogObject) = currentByName(row.Current.ObjectName).Where(Function(x) ExactMatch(row.Current, x)).ToList()
+                    If matchesNow.Count <> 1 OrElse matchesNow(0).Definition Is Nothing Then
+                        Throw New InvalidOperationException("El objeto " & row.Declaration.DisplayName() & " de [" & row.DatabaseName & "] ya no esta disponible. Vuelve a analizar.")
+                    End If
+                    Dim now As CatalogObject = matchesNow(0)
+                    If Not String.Equals(row.Current.Definition, now.Definition, StringComparison.Ordinal) OrElse
+                       row.Current.AnsiNulls <> now.AnsiNulls OrElse row.Current.QuotedIdentifier <> now.QuotedIdentifier Then
+                        Throw New InvalidOperationException("La definicion de " & row.Declaration.DisplayName() & " en [" & row.DatabaseName & "] cambio desde la vista previa. Vuelve a analizar.")
+                    End If
+                Next
             Next
-        Next
+        End Using
 
         Dim databaseNames As List(Of String) = selected.Select(Function(x) x.DatabaseName).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(Function(x) x, StringComparer.OrdinalIgnoreCase).ToList()
         ' Con una sola base se conserva la estructura de siempre; con varias, una subcarpeta por base.
@@ -607,58 +647,55 @@ Friend NotInheritable Class BackupService
         Return value.Replace(vbCrLf, vbLf).Replace(vbCr, vbLf).Replace(vbLf, vbCrLf)
     End Function
 
-    Private Shared Function ReadCatalog(request As BackupRequest, databaseName As String, objectNames As IEnumerable(Of String), cancellation As CancellationToken, progress As IProgress(Of String)) As List(Of CatalogObject)
+    ' Lee las definiciones en la base a la que ya apunta la conexion (ver DatabaseSession).
+    Private Shared Function ReadCatalog(connection As SqlConnection, databaseName As String, objectNames As IEnumerable(Of String), cancellation As CancellationToken, progress As IProgress(Of String)) As List(Of CatalogObject)
         Dim result As New List(Of CatalogObject)()
         Dim names As List(Of String) = objectNames.Where(Function(x) Not String.IsNullOrEmpty(x)).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
         If names.Count = 0 Then Return result
         cancellation.ThrowIfCancellationRequested()
         Try
-            Using connection As SqlConnection = CreateConnection(request, databaseName)
-                connection.Open()
+            Const batchSize As Integer = 500
+            For offset As Integer = 0 To names.Count - 1 Step batchSize
                 cancellation.ThrowIfCancellationRequested()
-                Const batchSize As Integer = 500
-                For offset As Integer = 0 To names.Count - 1 Step batchSize
-                    cancellation.ThrowIfCancellationRequested()
-                    Dim batch As List(Of String) = names.Skip(offset).Take(batchSize).ToList()
-                    If progress IsNot Nothing Then progress.Report("Consultando objetos " & (offset + 1).ToString() & "-" & (offset + batch.Count).ToString() & "/" & names.Count.ToString() & " en [" & databaseName & "]...")
-                    Using command As SqlCommand = connection.CreateCommand()
-                        command.CommandTimeout = 30
-                        Dim placeholders As New List(Of String)()
-                        For index As Integer = 0 To batch.Count - 1
-                            Dim parameterName As String = "@n" & index.ToString()
-                            placeholders.Add(parameterName)
-                            command.Parameters.Add(parameterName, SqlDbType.NVarChar, 128).Value = batch(index)
-                        Next
-                        Dim nameFilter As String = String.Join(",", placeholders)
-                        command.CommandText = "SELECT s.name, o.name, o.type, m.definition, m.uses_ansi_nulls, m.uses_quoted_identifier " &
-                                              "FROM sys.objects AS o " &
-                                              "JOIN sys.schemas AS s ON s.schema_id = o.schema_id " &
-                                              "JOIN sys.sql_modules AS m ON m.object_id = o.object_id " &
-                                              "WHERE o.type IN ('P','V','TR','FN','IF','TF') AND o.name IN (" & nameFilter & ") " &
-                                              "UNION ALL " &
-                                              "SELECT CAST(NULL AS nvarchar(128)), t.name, t.type, m.definition, m.uses_ansi_nulls, m.uses_quoted_identifier " &
-                                              "FROM sys.triggers AS t " &
-                                              "JOIN sys.sql_modules AS m ON m.object_id = t.object_id " &
-                                              "WHERE t.parent_class = 0 AND t.name IN (" & nameFilter & ");"
-                        Using registration As CancellationTokenRegistration = cancellation.Register(Sub() CancelCommand(command))
-                            cancellation.ThrowIfCancellationRequested()
-                            Using reader As SqlDataReader = command.ExecuteReader()
-                                While reader.Read()
-                                    cancellation.ThrowIfCancellationRequested()
-                                    result.Add(New CatalogObject With {
-                                        .SchemaName = If(reader.IsDBNull(0), Nothing, reader.GetString(0)),
-                                        .ObjectName = reader.GetString(1),
-                                        .TypeCode = reader.GetString(2).Trim(),
-                                        .Definition = If(reader.IsDBNull(3), Nothing, reader.GetString(3)),
-                                        .AnsiNulls = reader.GetBoolean(4),
-                                        .QuotedIdentifier = reader.GetBoolean(5)
-                                    })
-                                End While
-                            End Using
+                Dim batch As List(Of String) = names.Skip(offset).Take(batchSize).ToList()
+                If progress IsNot Nothing Then progress.Report("Consultando objetos " & (offset + 1).ToString() & "-" & (offset + batch.Count).ToString() & "/" & names.Count.ToString() & " en [" & databaseName & "]...")
+                Using command As SqlCommand = connection.CreateCommand()
+                    command.CommandTimeout = 30
+                    Dim placeholders As New List(Of String)()
+                    For index As Integer = 0 To batch.Count - 1
+                        Dim parameterName As String = "@n" & index.ToString()
+                        placeholders.Add(parameterName)
+                        command.Parameters.Add(parameterName, SqlDbType.NVarChar, 128).Value = batch(index)
+                    Next
+                    Dim nameFilter As String = String.Join(",", placeholders)
+                    command.CommandText = "SELECT s.name, o.name, o.type, m.definition, m.uses_ansi_nulls, m.uses_quoted_identifier " &
+                                          "FROM sys.objects AS o " &
+                                          "JOIN sys.schemas AS s ON s.schema_id = o.schema_id " &
+                                          "JOIN sys.sql_modules AS m ON m.object_id = o.object_id " &
+                                          "WHERE o.type IN ('P','V','TR','FN','IF','TF') AND o.name IN (" & nameFilter & ") " &
+                                          "UNION ALL " &
+                                          "SELECT CAST(NULL AS nvarchar(128)), t.name, t.type, m.definition, m.uses_ansi_nulls, m.uses_quoted_identifier " &
+                                          "FROM sys.triggers AS t " &
+                                          "JOIN sys.sql_modules AS m ON m.object_id = t.object_id " &
+                                          "WHERE t.parent_class = 0 AND t.name IN (" & nameFilter & ");"
+                    Using registration As CancellationTokenRegistration = cancellation.Register(Sub() CancelCommand(command))
+                        cancellation.ThrowIfCancellationRequested()
+                        Using reader As SqlDataReader = command.ExecuteReader()
+                            While reader.Read()
+                                cancellation.ThrowIfCancellationRequested()
+                                result.Add(New CatalogObject With {
+                                    .SchemaName = If(reader.IsDBNull(0), Nothing, reader.GetString(0)),
+                                    .ObjectName = reader.GetString(1),
+                                    .TypeCode = reader.GetString(2).Trim(),
+                                    .Definition = If(reader.IsDBNull(3), Nothing, reader.GetString(3)),
+                                    .AnsiNulls = reader.GetBoolean(4),
+                                    .QuotedIdentifier = reader.GetBoolean(5)
+                                })
+                            End While
                         End Using
                     End Using
-                Next
-            End Using
+                End Using
+            Next
         Catch ex As SqlException
             cancellation.ThrowIfCancellationRequested()
             Throw

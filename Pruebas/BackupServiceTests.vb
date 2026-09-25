@@ -1,3 +1,4 @@
+﻿Imports System.Diagnostics
 Imports System.IO
 Imports System.Reflection
 Imports System.Text
@@ -110,7 +111,18 @@ Public Class BackupServiceTests
     End Sub
 
     <TestMethod>
+    Public Sub RespaldarVariasBases_UsaUnaSolaConexionParaVerificar()
+        Dim analysis As BackupAnalysis = BackupService.Analyze(Request(db1, db2), CancellationToken.None, Nothing)
+        Dim opensBefore As Integer = BackupService.ConnectionsOpened
+        BackupService.Save(Request(db1, db2), analysis, analysis.Items.Where(Function(x) x.CanBackup).Select(Function(x) x.Key), CancellationToken.None, Nothing)
+        Assert.AreEqual(1, BackupService.ConnectionsOpened - opensBefore)
+    End Sub
+
+    <TestMethod>
     Public Sub AnalizarBaseQueFalla_NoDetieneLasDemas()
+        ' La base que falla va primero: la sesion debe recuperarse y seguir con la siguiente.
+        Dim reversed As BackupAnalysis = BackupService.Analyze(Request("Base_Que_No_Existe_XYZ", db1), CancellationToken.None, Nothing)
+        Assert.IsTrue(reversed.Items.Where(Function(x) x.DatabaseName = db1).All(Function(x) x.CanBackup))
         Dim analysis As BackupAnalysis = BackupService.Analyze(Request(db1, "Base_Que_No_Existe_XYZ"), CancellationToken.None, Nothing)
         Dim failed As List(Of AnalysisItem) = analysis.Items.Where(Function(x) x.DatabaseName = "Base_Que_No_Existe_XYZ").ToList()
         Assert.AreEqual(3, failed.Count)
@@ -207,6 +219,39 @@ Public Class BackupServiceTests
         CollectionAssert.IsSubsetOf({db1, db2}, names)
         Assert.IsFalse(names.Any(Function(x) {"master", "model", "msdb", "tempdb"}.Contains(x.ToLowerInvariant())))
         CollectionAssert.AreEqual(names.OrderBy(Function(x) x, StringComparer.OrdinalIgnoreCase).ToList(), names)
+    End Sub
+
+    <TestMethod>
+    Public Sub AnalizarMilesDeObjetosEnVariasBases()
+        Const count As Integer = 3000
+        Dim creates As New StringBuilder()
+        Dim declarations As New StringBuilder()
+        For index As Integer = 1 To count
+            creates.Append("CREATE PROCEDURE dbo.P_Masivo_").Append(index).Append(" AS SELECT ").Append(index).Append(vbCrLf).Append("GO").Append(vbCrLf)
+            declarations.Append("ALTER PROCEDURE dbo.P_Masivo_").Append(index).Append(" AS SELECT ").Append(If(index Mod 10 = 0, -index, index)).Append(vbCrLf).Append("GO").Append(vbCrLf)
+        Next
+        Dim massFixture As LocalDbFixture = LocalDbFixture.TryCreate(2)
+        Try
+            For Each db As String In massFixture.Databases
+                massFixture.ExecScript(db, creates.ToString())
+            Next
+            Dim massSource As String = Path.Combine(workFolder, "masivo")
+            Directory.CreateDirectory(massSource)
+            File.WriteAllText(Path.Combine(massSource, "masivo.sql"), declarations.ToString())
+            Dim request As BackupRequest = massFixture.NewRequest(massFixture.Databases, massSource, Path.Combine(workFolder, "out_masivo"))
+
+            Dim opensBefore As Integer = BackupService.ConnectionsOpened
+            Dim watch As Stopwatch = Stopwatch.StartNew()
+            Dim analysis As BackupAnalysis = BackupService.Analyze(request, CancellationToken.None, Nothing)
+            watch.Stop()
+            Console.WriteLine("Analizar " & count.ToString() & " objetos x 2 bases: " & watch.ElapsedMilliseconds.ToString() & " ms")
+            Assert.AreEqual(1, BackupService.ConnectionsOpened - opensBefore, "Analizar varias bases debe usar una sola conexion")
+            Assert.AreEqual(count * 2, analysis.Items.Count)
+            Assert.IsTrue(analysis.Items.All(Function(x) x.CanBackup))
+            Assert.AreEqual((count \ 10) * 2, analysis.Items.Where(Function(x) x.HasChanges).Count())
+        Finally
+            massFixture.Dispose()
+        End Try
     End Sub
 
     <TestMethod>
