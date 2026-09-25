@@ -2,7 +2,7 @@
 
 Proyecto VB.NET Windows Forms para Visual Studio 2022 y .NET Framework 4.8.
 
-Usa el paquete NuGet `Microsoft.Data.SqlClient`; Visual Studio lo restaura al compilar (desde la línea de comandos: `msbuild /restore`).
+El proyecto usa el formato SDK de .NET (sigue siendo Windows Forms sobre .NET Framework 4.8) y el paquete NuGet `Microsoft.Data.SqlClient`, que se restaura al compilar. Se compila desde Visual Studio o con `dotnet build RespaldoProcedimientosDesktop\RespaldoProcedimientosDesktop.vbproj`; el ejecutable queda en `bin\Debug\` (o `bin\Release\` con `-c Release`).
 
 Abra `RespaldoProcedimientosDesktop.sln` en Visual Studio. Complete servidor, usuario y password de SQL Server y pulse **Elegir bases...**: la aplicación se conecta a `master` y abre una lista con casillas de las bases de usuario en línea a las que ese login tiene acceso (no incluye `master`, `model`, `msdb` ni `tempdb`). Marque una o varias; el filtro y los botones **Marcar visibles** / **Desmarcar visibles** ayudan con listas largas. También puede escribir los nombres en el campo **Bases de datos**, separados por coma o punto y coma. Si vuelve a abrir la lista y acepta el mismo conjunto de bases, se conserva la vista previa.
 
@@ -40,6 +40,6 @@ Para ejecutarlas: desde el Explorador de pruebas de Visual Studio, o con
 powershell -ExecutionPolicy Bypass -File Pruebas\Ejecutar-Pruebas.ps1
 ```
 
-(`-Filtro "Name=..."` ejecuta solo algunas). `dotnet test` no se usa porque el proyecto principal tiene el formato clásico de Visual Studio.
+o directamente con `dotnet test Pruebas\RespaldoProcedimientosDesktop.Tests.vbproj` (`-Filtro "Name~Respaldar"` en el script, o `--filter` en `dotnet test`, ejecuta solo algunas).
 
 Todo se probó contra LocalDB; falta probarlo en el servidor real.
