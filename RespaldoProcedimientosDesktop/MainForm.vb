@@ -466,110 +466,171 @@ End Class
 Friend NotInheritable Class CompareForm
     Inherits Form
 
+    Private NotInheritable Class DiffView
+        Public Property Declaration As DeclaredObject
+        Public Property Title As String
+        Public Property Page As TabPage
+        Public Property Box As RichTextBox
+    End Class
+
+    Private ReadOnly item As AnalysisItem
+    Private ReadOnly ignoreWhitespaceBox As New CheckBox()
+    Private ReadOnly showAllBox As New CheckBox()
+    Private ReadOnly views As New List(Of DiffView)()
+
     Public Sub New(item As AnalysisItem)
+        Me.item = item
         Me.Text = "Comparar " & item.Declaration.DisplayName()
         Me.StartPosition = FormStartPosition.CenterParent
         Me.Size = New Size(1100, 750)
         Me.MinimumSize = New Size(800, 500)
 
+        Dim root As New TableLayoutPanel With {.Dock = DockStyle.Fill, .ColumnCount = 1, .RowCount = 2}
+        root.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100.0F))
+        root.RowStyles.Add(New RowStyle(SizeType.Absolute, 34.0F))
+        root.RowStyles.Add(New RowStyle(SizeType.Percent, 100.0F))
+
+        Dim options As New FlowLayoutPanel With {.Dock = DockStyle.Fill, .WrapContents = False}
+        ignoreWhitespaceBox.Text = "Ignorar diferencias de espacios y tabulaciones"
+        showAllBox.Text = "Mostrar el objeto completo"
+        For Each box As CheckBox In {ignoreWhitespaceBox, showAllBox}
+            box.AutoSize = True
+            box.Margin = New Padding(6, 8, 24, 3)
+            options.Controls.Add(box)
+            AddHandler box.CheckedChanged, Sub(sender, e) RenderDiffs()
+        Next
+        root.Controls.Add(options, 0, 0)
+
         Dim tabs As New TabControl With {.Dock = DockStyle.Fill}
-        Dim hasDuplicates As Boolean = item.AlsoDeclaredIn IsNot Nothing AndAlso item.AlsoDeclaredIn.Count > 0
-        Dim firstSuffix As String = If(hasDuplicates, " - " & Path.GetFileName(item.Declaration.SourceFile), "")
-        AddTab(tabs, "Diferencias" & firstSuffix, DiffService.Build(item.Current.Definition, item.Declaration.CandidateText))
-        AddTab(tabs, "Actual en SQL Server", item.Current.Definition)
-        AddTab(tabs, "Archivo de liberacion" & firstSuffix, item.Declaration.CandidateText)
-        If hasDuplicates Then
-            For Each other As DeclaredObject In item.AlsoDeclaredIn
-                Dim suffix As String = " - " & Path.GetFileName(other.SourceFile)
-                AddTab(tabs, "Diferencias" & suffix, DiffService.Build(item.Current.Definition, other.CandidateText))
-                AddTab(tabs, "Archivo de liberacion" & suffix, other.CandidateText)
-            Next
-        End If
-        Me.Controls.Add(tabs)
+        Dim declarations As New List(Of DeclaredObject) From {item.Declaration}
+        If item.AlsoDeclaredIn IsNot Nothing Then declarations.AddRange(item.AlsoDeclaredIn)
+        Dim hasDuplicates As Boolean = declarations.Count > 1
+        For Each declaration As DeclaredObject In declarations
+            Dim suffix As String = If(hasDuplicates, " - " & Path.GetFileName(declaration.SourceFile), "")
+            Dim view As New DiffView With {
+                .Declaration = declaration,
+                .Title = "Diferencias" & suffix,
+                .Page = New TabPage("Diferencias" & suffix),
+                .Box = CreateEditor()
+            }
+            view.Page.Controls.Add(view.Box)
+            tabs.TabPages.Add(view.Page)
+            views.Add(view)
+        Next
+        AddTextTab(tabs, "Actual en SQL Server", item.Current.Definition)
+        For Each declaration As DeclaredObject In declarations
+            AddTextTab(tabs, "Archivo de liberacion" & If(hasDuplicates, " - " & Path.GetFileName(declaration.SourceFile), ""), declaration.CandidateText)
+        Next
+        root.Controls.Add(tabs, 0, 1)
+        Me.Controls.Add(root)
+        RenderDiffs()
     End Sub
 
-    Private Shared Sub AddTab(tabs As TabControl, title As String, content As String)
-        Dim page As New TabPage(title)
-        Dim editor As New RichTextBox With {
+    Private Sub RenderDiffs()
+        For Each view As DiffView In views
+            Dim result As DiffResult = DiffService.Compare(item.Current.Definition, view.Declaration.CandidateText, ignoreWhitespaceBox.Checked)
+            Dim lines As List(Of DiffLine) = If(showAllBox.Checked, result.Lines, DiffService.Collapse(result.Lines, 3))
+            view.Box.Rtf = BuildRtf(result, lines, ignoreWhitespaceBox.Checked)
+            view.Page.Text = view.Title & If(result.HasDifferences,
+                                             " (-" & result.Removed.ToString() & " +" & result.Added.ToString() & ")",
+                                             " (iguales)")
+        Next
+    End Sub
+
+    Private Shared Function CreateEditor() As RichTextBox
+        Return New RichTextBox With {
             .Dock = DockStyle.Fill,
             .ReadOnly = True,
             .WordWrap = False,
-            .Font = New Font("Consolas", 10.0F),
-            .Text = content
+            .BackColor = SystemColors.Window,
+            .Font = New Font("Consolas", 10.0F)
         }
+    End Function
+
+    Private Shared Sub AddTextTab(tabs As TabControl, title As String, content As String)
+        Dim page As New TabPage(title)
+        Dim editor As RichTextBox = CreateEditor()
+        editor.Text = content
         page.Controls.Add(editor)
         tabs.TabPages.Add(page)
     End Sub
-End Class
 
-Friend NotInheritable Class DiffService
-    Private Sub New()
+    ' Colores: 1 gris (numeros de linea), 2 rojo (eliminado), 3 verde (agregado), 4 azul (tramos ocultos y encabezado).
+    Friend Shared Function BuildRtf(result As DiffResult, lines As List(Of DiffLine), ignoreWhitespace As Boolean) As String
+        Dim rtf As New StringBuilder()
+        rtf.Append("{\rtf1\ansi\deff0{\fonttbl{\f0\fmodern Consolas;}}")
+        rtf.Append("{\colortbl ;\red120\green120\blue120;\red178\green0\blue0;\red0\green120\blue0;\red0\green70\blue160;}")
+        rtf.Append("\f0\fs20 ")
+
+        Dim ignored As String = "Se ignoran los comentarios antes del CREATE, CREATE/ALTER/CREATE OR ALTER y los espacios al final de linea" &
+                                If(ignoreWhitespace, ", ademas de las diferencias de espacios y tabulaciones.", ".")
+        rtf.Append("\cf4\b ")
+        If result.HasDifferences Then
+            AppendRtfText(rtf, result.Removed.ToString() & " linea(s) solo en SQL Server (-), " & result.Added.ToString() & " linea(s) solo en el archivo (+).")
+        Else
+            AppendRtfText(rtf, "Sin diferencias.")
+        End If
+        rtf.Append("\b0\par ")
+        AppendRtfText(rtf, ignored)
+        rtf.Append("\par ")
+        If result.Truncated Then
+            AppendRtfText(rtf, "Las versiones son muy distintas: una parte se muestra como reemplazo completo.")
+            rtf.Append("\par ")
+        End If
+        rtf.Append("\cf1 ")
+        AppendRtfText(rtf, "  SQL  Arch.")
+        rtf.Append("\par\par ")
+
+        For Each line As DiffLine In lines
+            If line.Kind = DiffKind.Skipped Then
+                rtf.Append("\cf4\i ")
+                AppendRtfText(rtf, "            " & line.Text)
+                rtf.Append("\i0\par ")
+                Continue For
+            End If
+            Dim oldNumber As String = If(line.Kind = DiffKind.Added, "", line.OldNumber.ToString())
+            Dim newNumber As String = If(line.Kind = DiffKind.Removed, "", line.NewNumber.ToString())
+            rtf.Append("\cf1 ")
+            AppendRtfText(rtf, oldNumber.PadLeft(5) & " " & newNumber.PadLeft(5) & " ")
+            Select Case line.Kind
+                Case DiffKind.Removed
+                    rtf.Append("\cf2 ")
+                    AppendRtfText(rtf, "- " & line.Text)
+                Case DiffKind.Added
+                    rtf.Append("\cf3 ")
+                    AppendRtfText(rtf, "+ " & line.Text)
+                Case Else
+                    rtf.Append("\cf0 ")
+                    AppendRtfText(rtf, "  " & line.Text)
+            End Select
+            rtf.Append("\par ")
+        Next
+        rtf.Append("}")
+        Return rtf.ToString()
+    End Function
+
+    Private Shared Sub AppendRtfText(rtf As StringBuilder, text As String)
+        For Each character As Char In text
+            Select Case character
+                Case "\"c
+                    rtf.Append("\\")
+                Case "{"c
+                    rtf.Append("\{")
+                Case "}"c
+                    rtf.Append("\}")
+                Case ControlChars.Tab
+                    rtf.Append("\tab ")
+                Case Else
+                    Dim code As Integer = AscW(character)
+                    If code > 126 Then
+                        If code > 32767 Then code -= 65536
+                        rtf.Append("\u").Append(code.ToString()).Append("?")
+                    ElseIf code >= 32 Then
+                        rtf.Append(character)
+                    End If
+            End Select
+        Next
     End Sub
-
-    Public Shared Function Build(currentDefinition As String, candidateDefinition As String) As String
-        Dim currentLines As String() = Normalize(currentDefinition).Split({vbLf}, StringSplitOptions.None)
-        Dim candidateLines As String() = Normalize(candidateDefinition).Split({vbLf}, StringSplitOptions.None)
-        Dim output As New StringBuilder()
-        output.AppendLine("- Version actual en SQL Server")
-        output.AppendLine("+ Version del archivo .sql")
-        output.AppendLine()
-
-        Dim oldIndex As Integer = 0
-        Dim newIndex As Integer = 0
-        While oldIndex < currentLines.Length OrElse newIndex < candidateLines.Length
-            If output.Length > 2000000 Then
-                output.AppendLine("... Comparacion truncada por longitud ...")
-                Exit While
-            End If
-            If oldIndex >= currentLines.Length Then
-                output.AppendLine("+ " & candidateLines(newIndex))
-                newIndex += 1
-            ElseIf newIndex >= candidateLines.Length Then
-                output.AppendLine("- " & currentLines(oldIndex))
-                oldIndex += 1
-            ElseIf String.Equals(currentLines(oldIndex), candidateLines(newIndex), StringComparison.Ordinal) Then
-                output.AppendLine("  " & currentLines(oldIndex))
-                oldIndex += 1
-                newIndex += 1
-            Else
-                Dim oldOffset As Integer = -1
-                Dim newOffset As Integer = -1
-                Dim bestCost As Integer = Integer.MaxValue
-                For oldStep As Integer = 0 To Math.Min(30, currentLines.Length - oldIndex - 1)
-                    For newStep As Integer = 0 To Math.Min(30, candidateLines.Length - newIndex - 1)
-                        Dim cost As Integer = oldStep + newStep
-                        If cost > 0 AndAlso cost < bestCost AndAlso
-                           String.Equals(currentLines(oldIndex + oldStep), candidateLines(newIndex + newStep), StringComparison.Ordinal) Then
-                            bestCost = cost
-                            oldOffset = oldStep
-                            newOffset = newStep
-                        End If
-                    Next
-                Next
-
-                If oldOffset < 0 Then
-                    output.AppendLine("- " & currentLines(oldIndex))
-                    output.AppendLine("+ " & candidateLines(newIndex))
-                    oldIndex += 1
-                    newIndex += 1
-                Else
-                    For index As Integer = 0 To oldOffset - 1
-                        output.AppendLine("- " & currentLines(oldIndex + index))
-                    Next
-                    For index As Integer = 0 To newOffset - 1
-                        output.AppendLine("+ " & candidateLines(newIndex + index))
-                    Next
-                    oldIndex += oldOffset
-                    newIndex += newOffset
-                End If
-            End If
-        End While
-        Return output.ToString()
-    End Function
-
-    Private Shared Function Normalize(value As String) As String
-        Return value.Replace(vbCrLf, vbLf).Replace(vbCr, vbLf).TrimEnd(ChrW(10))
-    End Function
 End Class
 
 Friend NotInheritable Class DatabaseSearchForm

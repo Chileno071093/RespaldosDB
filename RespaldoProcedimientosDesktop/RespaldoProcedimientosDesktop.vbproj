@@ -50,6 +50,7 @@
     <Compile Include="SqlObjectParser.vb" />
     <Compile Include="BackupService.vb" />
     <Compile Include="UserSettings.vb" />
+    <Compile Include="DiffService.vb" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="MainForm.resx">
