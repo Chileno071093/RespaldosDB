@@ -27,7 +27,7 @@ Friend NotInheritable Class MainForm
     Private ReadOnly backupButton As New Button()
     Private ReadOnly compareButton As New Button()
     Private ReadOnly searchDatabasesButton As New Button()
-    Private ReadOnly cancelButton As New Button()
+    Private ReadOnly cancelOperationButton As New Button()
     Private ReadOnly selectAllButton As New Button()
     Private ReadOnly selectNoneButton As New Button()
     Private ReadOnly objectsGrid As New DataGridView()
@@ -107,13 +107,13 @@ Friend NotInheritable Class MainForm
         compareButton.Width = 105
         searchDatabasesButton.Text = "Buscar en bases"
         searchDatabasesButton.Width = 140
-        cancelButton.Text = "Cancelar"
-        cancelButton.Width = 145
+        cancelOperationButton.Text = "Cancelar"
+        cancelOperationButton.Width = 145
         selectAllButton.Text = "Marcar listos"
         selectAllButton.Width = 115
         selectNoneButton.Text = "Desmarcar"
         selectNoneButton.Width = 105
-        For Each button As Button In {analyzeButton, backupButton, compareButton, searchDatabasesButton, cancelButton, selectAllButton, selectNoneButton}
+        For Each button As Button In {analyzeButton, backupButton, compareButton, searchDatabasesButton, cancelOperationButton, selectAllButton, selectNoneButton}
             button.Height = 34
             actions.Controls.Add(button)
         Next
@@ -121,7 +121,7 @@ Friend NotInheritable Class MainForm
         AddHandler backupButton.Click, AddressOf BackupClicked
         AddHandler compareButton.Click, AddressOf CompareClicked
         AddHandler searchDatabasesButton.Click, AddressOf SearchDatabasesClicked
-        AddHandler cancelButton.Click, AddressOf CancelOperationClicked
+        AddHandler cancelOperationButton.Click, AddressOf CancelOperationClicked
         AddHandler selectAllButton.Click, Sub(sender, e) SetAllSelection(True)
         AddHandler selectNoneButton.Click, Sub(sender, e) SetAllSelection(False)
         root.Controls.Add(actions, 0, 2)
@@ -252,7 +252,7 @@ Friend NotInheritable Class MainForm
         Dim current As AnalysisItem = SelectedItem()
         compareButton.Enabled = Not busy AndAlso current IsNot Nothing AndAlso current.CanBackup
         searchDatabasesButton.Enabled = Not busy AndAlso analysis IsNot Nothing AndAlso objectsGrid.SelectedRows.Count > 0
-        cancelButton.Enabled = operationCancellation IsNot Nothing AndAlso Not operationCancellation.IsCancellationRequested
+        cancelOperationButton.Enabled = operationCancellation IsNot Nothing AndAlso Not operationCancellation.IsCancellationRequested
     End Sub
 
     Private Function SelectedItem() As AnalysisItem
@@ -328,47 +328,68 @@ Friend NotInheritable Class MainForm
         }
     End Function
 
-    Private Async Sub AnalyzeClicked(sender As Object, e As EventArgs)
+    ' Ejecuta una operacion en segundo plano con la ventana bloqueada y se encarga de la cancelacion,
+    ' los mensajes de error y la liberacion del password. Devuelve Nothing si se cancelo o fallo.
+    Private Async Function RunOperationAsync(Of T As Class)(startMessage As String,
+                                                           cancelledMessage As String,
+                                                           errorPrefix As String,
+                                                           errorTitle As String,
+                                                           work As Func(Of BackupRequest, CancellationToken, IProgress(Of String), T),
+                                                           Optional onError As Action = Nothing) As Task(Of T)
         Dim request As BackupRequest = Nothing
         Dim cancellation As CancellationTokenSource = Nothing
         Try
             request = CreateRequest()
             cancellation = New CancellationTokenSource()
-            operationCancellation = cancellation
-            busy = True
-            inputs.Enabled = False
-            optionsPanel.Enabled = False
-            RefreshActionButtons()
-            outputBox.Text = "Leyendo scripts y consultando la base de datos..."
+            SetBusy(True, cancellation)
+            outputBox.Text = startMessage
+            Dim token As CancellationToken = cancellation.Token
             Dim progress As IProgress(Of String) = New Progress(Of String)(Sub(message) ShowOperationProgress(cancellation, message))
-            Dim result As BackupAnalysis = Await Task.Run(Function() BackupService.Analyze(request, cancellation.Token, progress))
-            operationCancellation = Nothing
-            analysis = result
-            PopulateGrid(result.Items)
-            SaveSettings()
-            Dim ready As Integer = result.Items.Where(Function(x) x.CanBackup).Count()
-            summaryLabel.Text = result.Items.Count.ToString() & " objetos detectados; " & ready.ToString() & " listos; " &
-                                (result.Items.Count - ready).ToString() & " requieren revision."
-            outputBox.Text = "Marca objetos para el respaldo. Selecciona filas (Ctrl/Shift) para Comparar o Buscar en bases."
-            If result.FilesWithoutObject.Count > 0 Then
-                outputBox.AppendText(vbCrLf & result.FilesWithoutObject.Count.ToString() & " archivo(s) .sql sin declaraciones reconocidas.")
-            End If
+            Return Await Task.Run(Function() work(request, token, progress))
         Catch ex As OperationCanceledException
-            outputBox.Text = "Analisis cancelado. No se modifico ninguna base de datos."
+            outputBox.Text = cancelledMessage
         Catch ex As Exception
-            analysis = Nothing
-            objectsGrid.Rows.Clear()
-            outputBox.Text = "No se pudo analizar: " & ex.Message
-            MessageBox.Show(Me, ex.Message, "Error de analisis", MessageBoxButtons.OK, MessageBoxIcon.Error)
+            If onError IsNot Nothing Then onError()
+            outputBox.Text = errorPrefix & ex.Message
+            MessageBox.Show(Me, ex.Message, errorTitle, MessageBoxButtons.OK, MessageBoxIcon.Error)
         Finally
-            operationCancellation = Nothing
+            SetBusy(False, Nothing)
             If cancellation IsNot Nothing Then cancellation.Dispose()
             If request IsNot Nothing AndAlso request.Password IsNot Nothing Then request.Password.Dispose()
-            busy = False
-            inputs.Enabled = True
-            optionsPanel.Enabled = True
-            RefreshActionButtons()
         End Try
+        Return Nothing
+    End Function
+
+    Private Sub SetBusy(value As Boolean, cancellation As CancellationTokenSource)
+        busy = value
+        operationCancellation = cancellation
+        inputs.Enabled = Not value
+        optionsPanel.Enabled = Not value
+        RefreshActionButtons()
+    End Sub
+
+    Private Async Sub AnalyzeClicked(sender As Object, e As EventArgs)
+        Dim result As BackupAnalysis = Await RunOperationAsync(Of BackupAnalysis)(
+            "Leyendo scripts y consultando la base de datos...",
+            "Analisis cancelado. No se modifico ninguna base de datos.",
+            "No se pudo analizar: ", "Error de analisis",
+            Function(request, token, progress) BackupService.Analyze(request, token, progress),
+            Sub()
+                analysis = Nothing
+                objectsGrid.Rows.Clear()
+            End Sub)
+        If result Is Nothing Then Return
+
+        analysis = result
+        PopulateGrid(result.Items)
+        SaveSettings()
+        Dim ready As Integer = result.Items.Where(Function(x) x.CanBackup).Count()
+        summaryLabel.Text = result.Items.Count.ToString() & " objetos detectados; " & ready.ToString() & " listos; " &
+                            (result.Items.Count - ready).ToString() & " requieren revision."
+        outputBox.Text = "Marca objetos para el respaldo. Selecciona filas (Ctrl/Shift) para Comparar o Buscar en bases."
+        If result.FilesWithoutObject.Count > 0 Then
+            outputBox.AppendText(vbCrLf & result.FilesWithoutObject.Count.ToString() & " archivo(s) .sql sin declaraciones reconocidas.")
+        End If
     End Sub
 
     Private Sub CompareClicked(sender As Object, e As EventArgs)
@@ -388,42 +409,20 @@ Friend NotInheritable Class MainForm
         Next
         If selectedObjects.Count = 0 Then Return
 
-        Dim request As BackupRequest = Nothing
-        Dim cancellation As CancellationTokenSource = Nothing
-        Try
-            request = CreateRequest()
-            cancellation = New CancellationTokenSource()
-            operationCancellation = cancellation
-            busy = True
-            inputs.Enabled = False
-            optionsPanel.Enabled = False
-            RefreshActionButtons()
-            outputBox.Text = "Buscando los nombres seleccionados en las bases visibles del servidor..."
-            Dim progress As IProgress(Of String) = New Progress(Of String)(Sub(message) ShowOperationProgress(cancellation, message))
-            Dim report As DatabaseSearchReport = Await Task.Run(Function() BackupService.FindDatabases(request, selectedObjects, cancellation.Token, progress))
-            operationCancellation = Nothing
-            RefreshActionButtons()
-            outputBox.Text = "Buscadas " & report.ScannedDatabases.ToString() & " bases accesibles; " &
-                             report.Locations.Count.ToString() & " coincidencias visibles."
-            Using dialog As New DatabaseSearchForm(report)
-                If dialog.ShowDialog(Me) = DialogResult.OK AndAlso Not String.IsNullOrEmpty(dialog.SelectedDatabase) Then
-                    databaseBox.Text = dialog.SelectedDatabase
-                End If
-            End Using
-        Catch ex As OperationCanceledException
-            outputBox.Text = "Busqueda cancelada. No se modifico ninguna base de datos."
-        Catch ex As Exception
-            outputBox.Text = "No se pudo buscar en las bases: " & ex.Message
-            MessageBox.Show(Me, ex.Message, "Error de busqueda", MessageBoxButtons.OK, MessageBoxIcon.Error)
-        Finally
-            operationCancellation = Nothing
-            If cancellation IsNot Nothing Then cancellation.Dispose()
-            If request IsNot Nothing AndAlso request.Password IsNot Nothing Then request.Password.Dispose()
-            busy = False
-            inputs.Enabled = True
-            optionsPanel.Enabled = True
-            RefreshActionButtons()
-        End Try
+        Dim report As DatabaseSearchReport = Await RunOperationAsync(Of DatabaseSearchReport)(
+            "Buscando los nombres seleccionados en las bases visibles del servidor...",
+            "Busqueda cancelada. No se modifico ninguna base de datos.",
+            "No se pudo buscar en las bases: ", "Error de busqueda",
+            Function(request, token, progress) BackupService.FindDatabases(request, selectedObjects, token, progress))
+        If report Is Nothing Then Return
+
+        outputBox.Text = "Buscadas " & report.ScannedDatabases.ToString() & " bases accesibles; " &
+                         report.Locations.Count.ToString() & " coincidencias visibles."
+        Using dialog As New DatabaseSearchForm(report)
+            If dialog.ShowDialog(Me) = DialogResult.OK AndAlso Not String.IsNullOrEmpty(dialog.SelectedDatabase) Then
+                databaseBox.Text = dialog.SelectedDatabase
+            End If
+        End Using
     End Sub
 
     Private Sub ShowOperationProgress(cancellation As CancellationTokenSource, message As String)
@@ -432,7 +431,7 @@ Friend NotInheritable Class MainForm
 
     Private Sub CancelOperationClicked(sender As Object, e As EventArgs)
         If operationCancellation Is Nothing Then Return
-        cancelButton.Enabled = False
+        cancelOperationButton.Enabled = False
         outputBox.Text = "Cancelando operacion; espera a que termine el paso actual..."
         operationCancellation.Cancel()
     End Sub
@@ -447,40 +446,20 @@ Friend NotInheritable Class MainForm
         Next
         If selected.Count = 0 Then Return
 
-        Dim request As BackupRequest = Nothing
-        Dim cancellation As CancellationTokenSource = Nothing
-        Try
-            request = CreateRequest()
-            cancellation = New CancellationTokenSource()
-            operationCancellation = cancellation
-            busy = True
-            inputs.Enabled = False
-            optionsPanel.Enabled = False
-            RefreshActionButtons()
-            outputBox.Text = "Comprobando que SQL Server no cambio desde la vista previa y guardando archivos..."
-            Dim progress As IProgress(Of String) = New Progress(Of String)(Sub(message) ShowOperationProgress(cancellation, message))
-            Dim result As BackupResult = Await Task.Run(Function() BackupService.Save(request, analysis, selected, cancellation.Token, progress))
-            operationCancellation = Nothing
-            outputBox.Text = "Respaldo creado: " & result.Folder & vbCrLf &
-                             "Objetos guardados: " & result.SavedObjects.Count.ToString() & vbCrLf &
-                             "Archivos SQL verificados: " & result.VerifiedFiles.ToString() & vbCrLf &
-                             "Objetos omitidos: " & result.Skipped.Count.ToString() & vbCrLf & vbCrLf &
-                             String.Join(vbCrLf, result.SavedObjects)
-            MessageBox.Show(Me, "Respaldo terminado y archivos verificados.", "Resultado", MessageBoxButtons.OK, MessageBoxIcon.Information)
-        Catch ex As OperationCanceledException
-            outputBox.Text = "Respaldo cancelado. No se creo una carpeta final; se limpiaron los archivos temporales."
-        Catch ex As Exception
-            outputBox.Text = "No se pudo crear el respaldo: " & ex.Message
-            MessageBox.Show(Me, ex.Message, "Error de respaldo", MessageBoxButtons.OK, MessageBoxIcon.Error)
-        Finally
-            operationCancellation = Nothing
-            If cancellation IsNot Nothing Then cancellation.Dispose()
-            If request IsNot Nothing AndAlso request.Password IsNot Nothing Then request.Password.Dispose()
-            busy = False
-            inputs.Enabled = True
-            optionsPanel.Enabled = True
-            RefreshActionButtons()
-        End Try
+        Dim currentAnalysis As BackupAnalysis = analysis
+        Dim result As BackupResult = Await RunOperationAsync(Of BackupResult)(
+            "Comprobando que SQL Server no cambio desde la vista previa y guardando archivos...",
+            "Respaldo cancelado. No se creo una carpeta final; se limpiaron los archivos temporales.",
+            "No se pudo crear el respaldo: ", "Error de respaldo",
+            Function(request, token, progress) BackupService.Save(request, currentAnalysis, selected, token, progress))
+        If result Is Nothing Then Return
+
+        outputBox.Text = "Respaldo creado: " & result.Folder & vbCrLf &
+                         "Objetos guardados: " & result.SavedObjects.Count.ToString() & vbCrLf &
+                         "Archivos SQL verificados: " & result.VerifiedFiles.ToString() & vbCrLf &
+                         "Objetos omitidos: " & result.Skipped.Count.ToString() & vbCrLf & vbCrLf &
+                         String.Join(vbCrLf, result.SavedObjects)
+        MessageBox.Show(Me, "Respaldo terminado y archivos verificados.", "Resultado", MessageBoxButtons.OK, MessageBoxIcon.Information)
     End Sub
 End Class
 
