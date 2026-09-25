@@ -45,9 +45,6 @@ Friend NotInheritable Class MainForm
         Me.MinimumSize = New System.Drawing.Size(900, 620)
         Me.Size = New System.Drawing.Size(1150, 760)
 
-        databaseBox.Text = "AdministradorEmpleado_PEMSACELAYA"
-        sourceBox.Text = "C:\Users\Alonso Salinas\OneDrive\Desktop\Respaldos-SPs\Gestor Tiempo Extra\Fase 1\6 Reportes - Falta Liberar\Liberar Fase 1 TE\Interfaz"
-        destinationBox.Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Respaldos_TE")
         passwordBox.UseSystemPasswordChar = True
 
         Dim root As New TableLayoutPanel With {
@@ -142,12 +139,50 @@ Friend NotInheritable Class MainForm
         outputBox.Text = "Se leeran los nombres reales desde las declaraciones de cada archivo .sql."
         root.Controls.Add(outputBox, 0, 5)
         Me.Controls.Add(root)
+        ApplySettings(UserSettings.Load(UserSettings.DefaultPath))
 
         For Each box As TextBox In {serverBox, databaseBox, userBox, passwordBox, sourceBox, destinationBox}
             AddHandler box.TextChanged, AddressOf InputsChanged
         Next
         AddHandler includeSubfoldersBox.CheckedChanged, AddressOf InputsChanged
         RefreshActionButtons()
+    End Sub
+
+    Private Sub ApplySettings(settings As UserSettings)
+        serverBox.Text = If(settings.Server, "")
+        databaseBox.Text = If(settings.Database, "")
+        userBox.Text = If(settings.UserName, "")
+        sourceBox.Text = If(settings.SourceFolder, "")
+        destinationBox.Text = If(String.IsNullOrWhiteSpace(settings.DestinationFolder),
+                                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Respaldos_TE"),
+                                 settings.DestinationFolder)
+        includeSubfoldersBox.Checked = settings.IncludeSubfolders
+        encryptBox.Checked = settings.Encrypt
+        trustCertificateBox.Checked = settings.TrustServerCertificate
+        trustCertificateBox.Enabled = encryptBox.Checked
+    End Sub
+
+    Private Sub SaveSettings()
+        Dim settings As New UserSettings With {
+            .Server = serverBox.Text.Trim(),
+            .Database = databaseBox.Text.Trim(),
+            .UserName = userBox.Text.Trim(),
+            .SourceFolder = sourceBox.Text.Trim(),
+            .DestinationFolder = destinationBox.Text.Trim(),
+            .IncludeSubfolders = includeSubfoldersBox.Checked,
+            .Encrypt = encryptBox.Checked,
+            .TrustServerCertificate = trustCertificateBox.Checked
+        }
+        Try
+            settings.Save(UserSettings.DefaultPath)
+        Catch ex As Exception When TypeOf ex Is IOException OrElse TypeOf ex Is UnauthorizedAccessException
+            ' No guardar la configuracion no debe impedir usar ni cerrar la aplicacion.
+        End Try
+    End Sub
+
+    Protected Overrides Sub OnFormClosing(e As FormClosingEventArgs)
+        SaveSettings()
+        MyBase.OnFormClosing(e)
     End Sub
 
     Private Sub ConfigureGrid()
@@ -310,6 +345,7 @@ Friend NotInheritable Class MainForm
             operationCancellation = Nothing
             analysis = result
             PopulateGrid(result.Items)
+            SaveSettings()
             Dim ready As Integer = result.Items.Where(Function(x) x.CanBackup).Count()
             summaryLabel.Text = result.Items.Count.ToString() & " objetos detectados; " & ready.ToString() & " listos; " &
                                 (result.Items.Count - ready).ToString() & " requieren revision."

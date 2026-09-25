@@ -49,6 +49,7 @@
     </Compile>
     <Compile Include="SqlObjectParser.vb" />
     <Compile Include="BackupService.vb" />
+    <Compile Include="UserSettings.vb" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="MainForm.resx">
